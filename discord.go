@@ -9,9 +9,102 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// --- METRICS & RATE LIMIT STATE ---
+var (
+	metricReqs     atomic.Uint64
+	metric429s     atomic.Uint64
+	metric5xxs     atomic.Uint64
+	metricTimeouts atomic.Uint64
+	metricHits     atomic.Uint64
+	metricLatSum   atomic.Uint64 // ms cinsinden toplam gecikme
+	metricLatCount atomic.Uint64
+
+	// Tüm worker'ları durduracak global timestamp (UnixNano)
+	globalPauseUntil atomic.Int64
+)
+
+// metricsTicker canlı performansı konsola yazar
+func metricsTicker(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastReqs, lastLatSum, lastLatCount uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reqs := metricReqs.Load()
+			latSum := metricLatSum.Load()
+			latCount := metricLatCount.Load()
+
+			deltaReqs := reqs - lastReqs
+			deltaLatSum := latSum - lastLatSum
+			deltaLatCount := latCount - lastLatCount
+
+			reqRate := deltaReqs / 5
+
+			var avgLat uint64
+			if deltaLatCount > 0 {
+				avgLat = deltaLatSum / deltaLatCount
+			}
+
+			fmt.Printf("📊 Speed: %d req/s | 📡 Avg Latency: %d ms | 🟢 429s: %d | 🔴 5xxs: %d | 🎯 Hits: %d\n",
+				reqRate, avgLat, metric429s.Load(), metric5xxs.Load(), metricHits.Load())
+
+			lastReqs = reqs
+			lastLatSum = latSum
+			lastLatCount = latCount
+		}
+	}
+}
+
+// waitIfRateLimited global duraklatma süresine kadar bekler
+func waitIfRateLimited(ctx context.Context) {
+	for {
+		now := time.Now().UnixNano()
+		pauseUntil := globalPauseUntil.Load()
+		if pauseUntil <= now {
+			return
+		}
+		
+		sleepDur := time.Duration(pauseUntil - now)
+		
+		// Context bitişini kaçırmamak için select ile bekle
+		timer := time.NewTimer(sleepDur)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			// Bekleme bitti, çık
+			return
+		}
+	}
+}
+
+// updateGlobalPause yeni bir bekleme süresi set eder
+func updateGlobalPause(d time.Duration) {
+	pauseUntil := time.Now().Add(d).UnixNano()
+	for {
+		current := globalPauseUntil.Load()
+		if pauseUntil <= current {
+			break // Sistem zaten daha uzun süre duraklatılmış
+		}
+		if globalPauseUntil.CompareAndSwap(current, pauseUntil) {
+			break
+		}
+	}
+}
+
+// ------------------------------------
 
 type WebhookPayload struct {
 	Embeds []WebhookEmbed `json:"embeds"`
@@ -50,55 +143,103 @@ func getDiscordCombinations(length int, charset []byte) int64 {
 }
 
 func checkDiscordName(ctx context.Context, name string, results chan<- CheckResult) {
-	// 🛡️ GÜVENLİK: İnsansı davranış simülasyonu. İstek atmadan önce rastgele 3-6 saniye bekle.
-	jitter := time.Duration(3000+rand.Intn(3000)) * time.Millisecond
-	time.Sleep(jitter)
+	// Sıfır allocation payload (string concat Go'da küçüktür)
+	payloadBytes := []byte(`{"username":"` + name + `"}`)
+	token := os.Getenv("DISCORD_TOKEN")
 
-	payload := fmt.Sprintf(`{"username":"%s"}`, name)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://discord.com/api/v9/users/@me/pomelo-attempt", strings.NewReader(payload))
-	if err != nil {
-		results <- CheckResult{Name: name, Status: StatusUnknown}
-		return
-	}
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		
+		// 🛡️ GÜVENLİK & KONTROL: Rate Limit varsa tüm worker'lar burada bekler
+		waitIfRateLimited(ctx)
 
-	// 🛡️ GÜVENLİK: Google Chrome tarayıcı taklidi
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Origin", "https://discord.com")
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://discord.com/api/v9/users/@me/pomelo-attempt", bytes.NewReader(payloadBytes))
+		if err != nil {
+			continue
+		}
 
-	if token := os.Getenv("DISCORD_TOKEN"); token != "" {
-		req.Header.Set("Authorization", token)
-	}
+		// 🛡️ GÜVENLİK: Dürüst ve standart header'lar. Spoofing YOK.
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "SafeScanner/1.0 (Rate-Limit Compliant Bot)")
+		req.Header.Set("Accept", "*/*")
+		if token != "" {
+			req.Header.Set("Authorization", token)
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		results <- CheckResult{Name: name, Status: StatusUnknown}
-		return
-	}
-	defer resp.Body.Close()
+		start := time.Now()
+		resp, err := client.Do(req)
+		latency := time.Since(start).Milliseconds()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	respStr := string(bodyBytes)
+		if err != nil {
+			metricTimeouts.Add(1)
+			time.Sleep(1 * time.Second) // Ağ hatası durumunda minik backoff
+			continue
+		}
 
-	if resp.StatusCode == 200 {
-		if strings.Contains(respStr, `"taken": false`) || strings.Contains(respStr, `"taken":false`) {
-			results <- CheckResult{Name: name, Status: StatusAvailable}
+		metricReqs.Add(1)
+		metricLatSum.Add(uint64(latency))
+		metricLatCount.Add(1)
+
+		// Body'i oku, Connection Reuse için kesin kapatılması lazım
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		respStr := string(bodyBytes)
+
+		// 🛡️ GÜVENLİK: Discord Header tabanlı Adaptive Rate Control
+		remainingStr := resp.Header.Get("X-RateLimit-Remaining")
+		if remainingStr == "0" {
+			resetAfterStr := resp.Header.Get("X-RateLimit-Reset-After")
+			if resetAfter, err := strconv.ParseFloat(resetAfterStr, 64); err == nil {
+				updateGlobalPause(time.Duration(resetAfter * float64(time.Second)))
+			}
+		}
+
+		if resp.StatusCode == 200 {
+			if strings.Contains(respStr, `"taken": false`) || strings.Contains(respStr, `"taken":false`) {
+				results <- CheckResult{Name: name, Status: StatusAvailable}
+			} else {
+				results <- CheckResult{Name: name, Status: StatusUsed}
+			}
+			return
+
+		} else if resp.StatusCode == 429 {
+			metric429s.Add(1)
+			
+			// 🛡️ GÜVENLİK: Retry-After değerine mutlak itaat.
+			retryAfterStr := resp.Header.Get("Retry-After")
+			var pauseDuration time.Duration
+			if retryAfterStr != "" {
+				if retryAfter, err := strconv.ParseFloat(retryAfterStr, 64); err == nil {
+					pauseDuration = time.Duration(retryAfter * float64(time.Second))
+				}
+			}
+			
+			if pauseDuration <= 0 {
+				pauseDuration = 5 * time.Second // Fallback değer
+			}
+			
+			// Güvenlik marjı (+100ms) ekleyelim ki request sınırda tekrar 429 yemesin.
+			updateGlobalPause(pauseDuration + (100 * time.Millisecond))
+			
+			// Hata attempt'ini tüketmemek için attempt'i 1 geri al (Çünkü bu bizim suçumuz değil, limit)
+			attempt--
+			continue
+
+		} else if resp.StatusCode >= 500 {
+			metric5xxs.Add(1)
+			// Exponential Backoff + Jitter
+			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+			time.Sleep(backoff + jitter)
+			continue
+		} else {
+			// 401, 403, 404 gibi çözülemeyen client hataları
+			results <- CheckResult{Name: name, Status: StatusUnknown}
 			return
 		}
-		results <- CheckResult{Name: name, Status: StatusUsed}
-		return
-	} else if resp.StatusCode == 429 {
-		// 🛡️ GÜVENLİK: Çok fazla istek uyarısı alırsak IP dinlendirmesi için 60 saniye bekle
-		fmt.Printf("⚠️ [DISCORD RATE LIMIT] Sistem %s için 60 saniye duraklatıldı!\n", name)
-		time.Sleep(60 * time.Second)
-		results <- CheckResult{Name: name, Status: StatusUnknown}
-		return
-	} else {
-		results <- CheckResult{Name: name, Status: StatusUnknown}
-		return
 	}
+	
+	results <- CheckResult{Name: name, Status: StatusUnknown}
 }
 
 func BuildDiscordWebhookPayload(hit CheckResult) WebhookPayload {
@@ -141,14 +282,22 @@ func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
 
 func sendToDiscord(payload WebhookPayload) {
 	jsonBytes, err := json.Marshal(payload)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(jsonBytes))
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
+	
+	// Bağlantının Connection Pool'a geri dönebilmesi için body'i kesinlikle discard edip kapatmalıyız.
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
