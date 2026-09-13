@@ -55,6 +55,19 @@ var blacklistMap = make(map[string]struct{})
 var currentLoop atomic.Int64
 
 func main() {
+	// Render PORT entegrasyonu ve sağlık kontrolü sunucusu
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	go func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Discord Scanner 24/7 Aktif! 🚀"))
+		})
+		http.ListenAndServe(":"+port, nil)
+	}()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
