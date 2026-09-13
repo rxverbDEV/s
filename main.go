@@ -18,20 +18,24 @@ import (
 var (
 	length     = getEnvInt("LENGTH", 3)
 	charsetOpt = getEnvInt("CHARSET", 4)
-	threads    = 1 // 🛡️ GÜVENLİK: Discord için ban riskini sıfırlamak adına zorunlu 1 yapıldı
+	threads    = getEnvInt("THREADS", 1) // Güvenli başlangıç değeri. Çok artırmak 429'a neden olur.
 	workerID   = getEnvInt("WORKER_ID", 0)
 	totalNodes = getEnvInt("TOTAL_WORKERS", 1)
 	webhookURL = os.Getenv("WEBHOOK_URL")
 )
 
+// HTTP Client Optimizasyonu: Yüksek verim, düşük connection pressure.
 var client = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true, // Modern tarayıcı gibi davranması için
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       100, // Discord'a aynı anda açılacak maksimum bağlantı sınırı
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false, // Bant genişliği tasarrufu için açık kalsın
+		ForceAttemptHTTP2:     true,
 	},
 }
 
@@ -48,10 +52,7 @@ type CheckResult struct {
 
 var webhookQueue = make(chan WebhookPayload, 1000)
 var blacklistMap = make(map[string]struct{})
-var (
-	scannedCount int64
-	currentLoop  int64 = 1
-)
+var currentLoop atomic.Int64
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -82,8 +83,6 @@ func main() {
 		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789")
 	case 3:
 		charset = []byte("abcdefghijklmnopqrstuvwxyz_")
-	case 4:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789_")
 	default:
 		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789_")
 	}
@@ -105,6 +104,9 @@ func main() {
 	fmt.Printf("🛡️ Blacklist: %d kayıt yüklendi\n", len(blacklistMap))
 	fmt.Println("===========================================")
 
+	// Metrik izleyicisini başlat
+	go metricsTicker(ctx)
+
 	jobs := make(chan string, threads*2)
 	results := make(chan CheckResult, 100)
 
@@ -114,10 +116,12 @@ func main() {
 		go worker(ctx, jobs, results)
 	}
 
+	currentLoop.Store(1)
+
 outerLoop:
 	for {
-		atomic.StoreInt64(&currentLoop, atomic.LoadInt64(&currentLoop))
-		fmt.Printf("\n🔄 --- [TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", atomic.LoadInt64(&currentLoop))
+		loopVal := currentLoop.Load()
+		fmt.Printf("\n🔄 --- [TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", loopVal)
 
 		for idx := startIdx; idx < endIdx; idx++ {
 			select {
@@ -129,9 +133,9 @@ outerLoop:
 			}
 		}
 
-		fmt.Printf("✅ --- [%d. TUR LİSTESİ BİTTİ, 5 SANİYE BEKLENİYOR] ---\n", atomic.LoadInt64(&currentLoop))
+		fmt.Printf("✅ --- [%d. TUR LİSTESİ BİTTİ, 5 SANİYE BEKLENİYOR] ---\n", loopVal)
 		time.Sleep(5 * time.Second)
-		atomic.AddInt64(&currentLoop, 1)
+		currentLoop.Add(1)
 	}
 
 	close(jobs)
@@ -174,14 +178,16 @@ func evaluateName(name string) string {
 	} else if hasLetter && hasNumber && !hasUnderscore {
 		score += 2.0
 	}
-	
+
 	if len(name) == 3 {
 		score += 2.0
 	} else if len(name) == 4 {
 		score += 1.0
 	}
 
-	if score > 10.0 { score = 10.0 }
+	if score > 10.0 {
+		score = 10.0
+	}
 	return fmt.Sprintf("%.1f/10", score)
 }
 
@@ -194,7 +200,6 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 			if !ok {
 				return
 			}
-			atomic.AddInt64(&scannedCount, 1)
 			checkDiscordName(ctx, name, results)
 		}
 	}
@@ -217,21 +222,26 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 		case res := <-results:
 			lowerName := strings.ToLower(res.Name)
 
-			if _, exists := blacklistMap[lowerName]; exists { continue }
-			if _, seen := seenHits[lowerName]; seen { continue }
-			seenHits[lowerName] = struct{}{}
+			if _, exists := blacklistMap[lowerName]; exists {
+				continue
+			}
+			if _, seen := seenHits[lowerName]; seen {
+				continue
+			}
+			
+			if res.Status == StatusAvailable {
+				seenHits[lowerName] = struct{}{}
+				metricHits.Add(1)
+				fmt.Printf("🔥 [%s] -> %s\n", res.Status, res.Name)
+				f.WriteString(fmt.Sprintf("%s | %s\n", res.Name, res.Status))
+				f.Sync()
 
-			if res.Status == StatusUsed || res.Status == StatusUnknown { continue }
-
-			fmt.Printf("🔥 [%s] -> %s\n", res.Status, res.Name)
-			f.WriteString(fmt.Sprintf("%s | %s\n", res.Name, res.Status))
-			f.Sync()
-
-			if webhookURL != "" {
-				payload := BuildDiscordWebhookPayload(res)
-				select {
-				case webhookQueue <- payload:
-				default:
+				if webhookURL != "" {
+					payload := BuildDiscordWebhookPayload(res)
+					select {
+					case webhookQueue <- payload:
+					default:
+					}
 				}
 			}
 		}
