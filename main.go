@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -33,8 +34,8 @@ var (
 )
 
 var (
-	length     = getEnvInt("LENGTH", 3)
-	charsetOpt = getEnvInt("CHARSET", 4)
+	length     = getEnvInt("LENGTH", 4) // Chess.com için güvenli alt sınır genelde 3-4 karakterdir
+	charsetOpt = getEnvInt("CHARSET", 2)
 	threads    = getEnvInt("THREADS", 1) // Güvenli başlangıç değeri. Çok artırmak 429'a neden olur.
 	workerID   = getEnvInt("WORKER_ID", 0)
 	totalNodes = getEnvInt("TOTAL_WORKERS", 1)
@@ -47,7 +48,7 @@ var client = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       100, // Discord'a aynı anda açılacak maksimum bağlantı sınırı
+		MaxConnsPerHost:       100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -72,10 +73,11 @@ type WebhookPayload struct {
 }
 
 type WebhookEmbed struct {
-	Title  string         `json:"title"`
-	Color  int            `json:"color"`
-	Fields []WebhookField `json:"fields"`
-	Footer WebhookFooter  `json:"footer"`
+	Title       string         `json:"title"`
+	Description string         `json:"description,omitempty"`
+	Color       int            `json:"color"`
+	Fields      []WebhookField `json:"fields"`
+	Footer      WebhookFooter  `json:"footer"`
 }
 
 type WebhookField struct {
@@ -101,7 +103,7 @@ func main() {
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Discord Scanner 24/7 Aktif! 🚀"))
+			w.Write([]byte("Chess.com Scanner 24/7 Aktif! 🚀"))
 		})
 		http.ListenAndServe(":"+port, nil)
 	}()
@@ -117,7 +119,7 @@ func main() {
 		cancel()
 	}()
 
-	fmt.Println("⚡ === DISCORD GÜVENLİ (LOW-RISK) TARAYICI BAŞLATILIYOR === ⚡")
+	fmt.Println("⚡ === CHESS.COM GÜVENLİ (LOW-RISK) TARAYICI BAŞLATILIYOR === ⚡")
 	loadBlacklist()
 
 	if webhookURL != "" {
@@ -133,12 +135,12 @@ func main() {
 	case 2:
 		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789")
 	case 3:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz_")
+		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-")
 	default:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789_")
+		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-_")
 	}
 
-	totalCombinations := getDiscordCombinations(length, charset)
+	totalCombinations := getCombinations(length, charset)
 	chunkSize := int64(math.Ceil(float64(totalCombinations) / float64(totalNodes)))
 	startIdx := int64(workerID) * chunkSize
 	endIdx := startIdx + chunkSize
@@ -146,7 +148,7 @@ func main() {
 		endIdx = totalCombinations
 	}
 
-	fmt.Printf("Platform: Discord\n")
+	fmt.Printf("Platform: Chess.com\n")
 	fmt.Printf("Hız: %d Thread (Güvenli Mod) | Kapsam: %d Karakter\n", threads, length)
 	fmt.Printf("🎯 Görev Dağılımı: Hedef %d isim\n", endIdx-startIdx)
 	if webhookURL != "" {
@@ -179,7 +181,7 @@ outerLoop:
 			case <-ctx.Done():
 				break outerLoop
 			default:
-				name := generateDiscordName(idx, length, charset)
+				name := generateName(idx, length, charset)
 				jobs <- name
 			}
 		}
@@ -238,9 +240,9 @@ func waitIfRateLimited(ctx context.Context) {
 		if pauseUntil <= now {
 			return
 		}
-		
+
 		sleepDur := time.Duration(pauseUntil - now)
-		
+
 		timer := time.NewTimer(sleepDur)
 		select {
 		case <-ctx.Done():
@@ -266,7 +268,7 @@ func updateGlobalPause(d time.Duration) {
 	}
 }
 
-func generateDiscordName(index int64, length int, charset []byte) string {
+func generateName(index int64, length int, charset []byte) string {
 	b := make([]byte, length)
 	cLen := int64(len(charset))
 
@@ -277,30 +279,41 @@ func generateDiscordName(index int64, length int, charset []byte) string {
 	return string(b)
 }
 
-func getDiscordCombinations(length int, charset []byte) int64 {
+func getCombinations(length int, charset []byte) int64 {
 	return intPow(int64(len(charset)), int64(length))
 }
 
-func checkDiscordName(ctx context.Context, name string, results chan<- CheckResult) {
-	payloadBytes := []byte(`{"username":"` + name + `"}`)
-	token := os.Getenv("DISCORD_TOKEN")
+// isValidChessName, Chess.com kullanıcı adı kurallarına göre bir ön filtreleme yapar
+// Gereksiz network requestlerini azaltır.
+func isValidChessName(name string) bool {
+	if len(name) < 3 || len(name) > 20 {
+		return false
+	}
+	// Başta veya sonda tire/alt çizgi olamaz
+	if name[0] == '-' || name[0] == '_' || name[len(name)-1] == '-' || name[len(name)-1] == '_' {
+		return false
+	}
+	// Art arda gelen özel karakterler genellikle yasaktır
+	if strings.Contains(name, "--") || strings.Contains(name, "__") || strings.Contains(name, "-_") || strings.Contains(name, "_-") {
+		return false
+	}
+	return true
+}
 
+func checkChessName(ctx context.Context, name string, results chan<- CheckResult) {
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		
+
 		waitIfRateLimited(ctx)
 
-		req, err := http.NewRequestWithContext(ctx, "POST", "https://discord.com/api/v9/users/@me/pomelo-attempt", bytes.NewReader(payloadBytes))
+		// Chess.com Pub API: Kullanıcı mevcutsa 200 döner, değilse 404 döner.
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.chess.com/pub/player/"+name, nil)
 		if err != nil {
 			continue
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "SafeScanner/1.0 (Rate-Limit Compliant Bot)")
-		req.Header.Set("Accept", "*/*")
-		if token != "" {
-			req.Header.Set("Authorization", token)
-		}
+		req.Header.Set("User-Agent", "SafeScanner/1.0")
+		req.Header.Set("Accept", "application/json")
 
 		start := time.Now()
 		resp, err := client.Do(req)
@@ -316,29 +329,23 @@ func checkDiscordName(ctx context.Context, name string, results chan<- CheckResu
 		metricLatSum.Add(uint64(latency))
 		metricLatCount.Add(1)
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		// Body'yi tamamen oku ve kapat ki connection reuse yapılabilsin.
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		respStr := string(bodyBytes)
-
-		remainingStr := resp.Header.Get("X-RateLimit-Remaining")
-		if remainingStr == "0" {
-			resetAfterStr := resp.Header.Get("X-RateLimit-Reset-After")
-			if resetAfter, err := strconv.ParseFloat(resetAfterStr, 64); err == nil {
-				updateGlobalPause(time.Duration(resetAfter * float64(time.Second)))
-			}
-		}
 
 		if resp.StatusCode == 200 {
-			if strings.Contains(respStr, `"taken": false`) || strings.Contains(respStr, `"taken":false`) {
-				results <- CheckResult{Name: name, Status: StatusAvailable}
-			} else {
-				results <- CheckResult{Name: name, Status: StatusUsed}
-			}
+			// Kullanıcı mevcut
+			results <- CheckResult{Name: name, Status: StatusUsed}
+			return
+
+		} else if resp.StatusCode == 404 {
+			// API 404 döndürüyorsa, kullanıcı henüz alınmamış/mevcut değildir
+			results <- CheckResult{Name: name, Status: StatusAvailable}
 			return
 
 		} else if resp.StatusCode == 429 {
 			metric429s.Add(1)
-			
+
 			retryAfterStr := resp.Header.Get("Retry-After")
 			var pauseDuration time.Duration
 			if retryAfterStr != "" {
@@ -346,13 +353,13 @@ func checkDiscordName(ctx context.Context, name string, results chan<- CheckResu
 					pauseDuration = time.Duration(retryAfter * float64(time.Second))
 				}
 			}
-			
+
 			if pauseDuration <= 0 {
 				pauseDuration = 5 * time.Second
 			}
-			
-			updateGlobalPause(pauseDuration + (100 * time.Millisecond))
-			
+
+			updateGlobalPause(pauseDuration + (250 * time.Millisecond))
+
 			attempt--
 			continue
 
@@ -367,15 +374,18 @@ func checkDiscordName(ctx context.Context, name string, results chan<- CheckResu
 			return
 		}
 	}
-	
+
 	results <- CheckResult{Name: name, Status: StatusUnknown}
 }
 
-func BuildDiscordWebhookPayload(hit CheckResult) WebhookPayload {
+func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
 	score := evaluateName(hit.Name)
 	charCount := len(hit.Name)
 	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
 	typeDesc := fmt.Sprintf("%dL", charCount)
+
+	encodedName := url.PathEscape(hit.Name)
+	profileURL := fmt.Sprintf("https://www.chess.com/member/%s", encodedName)
 
 	fields := []WebhookField{
 		{Name: "👤 İsim", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
@@ -383,16 +393,17 @@ func BuildDiscordWebhookPayload(hit CheckResult) WebhookPayload {
 		{Name: "📊 Durum", Value: fmt.Sprintf("`%s`", hit.Status), Inline: true},
 		{Name: "🧩 Karakter", Value: fmt.Sprintf("`%d karakter`", charCount), Inline: true},
 		{Name: "🏷️ Tip", Value: fmt.Sprintf("`%s`", typeDesc), Inline: true},
+		{Name: "🔗 Profil", Value: fmt.Sprintf("[Görüntüle](%s)", profileURL), Inline: true},
 		{Name: "🕐 Bulunma", Value: fmt.Sprintf("`%s`", timeStr), Inline: false},
 	}
 
 	return WebhookPayload{
 		Embeds: []WebhookEmbed{
 			{
-				Title:  "🎯 DISCORD USERNAME HIT",
+				Title:  "🎯 CHESS.COM USERNAME HIT",
 				Color:  5763719,
 				Fields: fields,
-				Footer: WebhookFooter{Text: "Safe Scanner • Discord"},
+				Footer: WebhookFooter{Text: fmt.Sprintf("Username Scanner • Chess.com • Node %d", workerID)},
 			},
 		},
 	}
@@ -425,7 +436,7 @@ func sendToDiscord(payload WebhookPayload) {
 	if err != nil {
 		return
 	}
-	
+
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
@@ -446,7 +457,7 @@ func loadBlacklist() {
 
 func evaluateName(name string) string {
 	score := 5.0
-	hasLetter, hasNumber, hasUnderscore := false, false, false
+	hasLetter, hasNumber, hasSpecial := false, false, false
 
 	for i := 0; i < len(name); i++ {
 		c := name[i]
@@ -454,16 +465,16 @@ func evaluateName(name string) string {
 			hasLetter = true
 		} else if c >= '0' && c <= '9' {
 			hasNumber = true
-		} else if c == '_' {
-			hasUnderscore = true
+		} else if c == '_' || c == '-' {
+			hasSpecial = true
 		}
 	}
 
-	if hasLetter && !hasNumber && !hasUnderscore {
+	if hasLetter && !hasNumber && !hasSpecial {
 		score += 3.0
-	} else if hasNumber && !hasLetter && !hasUnderscore {
+	} else if hasNumber && !hasLetter && !hasSpecial {
 		score += 1.0
-	} else if hasLetter && hasNumber && !hasUnderscore {
+	} else if hasLetter && hasNumber && !hasSpecial {
 		score += 2.0
 	}
 
@@ -488,7 +499,11 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 			if !ok {
 				return
 			}
-			checkDiscordName(ctx, name, results)
+			// Chess.com özel kurallarına takılan isimi direkt reddet, API'ye gidip vakit kaybetme
+			if !isValidChessName(name) {
+				continue
+			}
+			checkChessName(ctx, name, results)
 		}
 	}
 }
@@ -496,7 +511,7 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 func resultHandler(ctx context.Context, results <-chan CheckResult) {
 	seenHits := make(map[string]struct{})
 
-	f, err := os.OpenFile("hits_discord.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("hits_chess.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("Dosya açılamadı:", err)
 		return
@@ -516,7 +531,7 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 			if _, seen := seenHits[lowerName]; seen {
 				continue
 			}
-			
+
 			if res.Status == StatusAvailable {
 				seenHits[lowerName] = struct{}{}
 				metricHits.Add(1)
@@ -525,7 +540,7 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 				f.Sync()
 
 				if webhookURL != "" {
-					payload := BuildDiscordWebhookPayload(res)
+					payload := BuildChessWebhookPayload(res)
 					select {
 					case webhookQueue <- payload:
 					default:
