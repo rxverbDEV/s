@@ -26,23 +26,21 @@ var (
 	metric5xxs     atomic.Uint64
 	metricTimeouts atomic.Uint64
 	metricHits     atomic.Uint64
-	metricLatSum   atomic.Uint64 // ms cinsinden toplam gecikme
+	metricLatSum   atomic.Uint64
 	metricLatCount atomic.Uint64
 
-	// Tüm worker'ları durduracak global timestamp (UnixNano)
 	globalPauseUntil atomic.Int64
 )
 
 var (
-	length     = getEnvInt("LENGTH", 3)// Chess.com için güvenli alt sınır genelde 3-4 karakterdir
-	charsetOpt = getEnvInt("CHARSET", 4)
-	threads    = getEnvInt("THREADS", 1) // Güvenli başlangıç değeri. Çok artırmak 429'a neden olur.
+	length     = getEnvInt("LENGTH", 3) // Sadece 3 haneli (3L) arama için varsayılan 3 olarak sabitlendi
+	charsetOpt = getEnvInt("CHARSET", 4) // 4: Harfler, rakamlar, tire (-) ve alt çizgi (_) dahil tüm geçerli karakterler
+	threads    = getEnvInt("THREADS", 1)
 	workerID   = getEnvInt("WORKER_ID", 0)
 	totalNodes = getEnvInt("TOTAL_WORKERS", 1)
 	webhookURL = os.Getenv("WEBHOOK_URL")
 )
 
-// HTTP Client Optimizasyonu: Yüksek verim, düşük connection pressure.
 var client = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
@@ -52,7 +50,7 @@ var client = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    false, // Bant genişliği tasarrufu için açık kalsın
+		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 	},
 }
@@ -95,7 +93,6 @@ var blacklistMap = make(map[string]struct{})
 var currentLoop atomic.Int64
 
 func main() {
-	// 🌐 Render PORT entegrasyonu ve sağlık kontrolü sunucusu
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -103,7 +100,7 @@ func main() {
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Chess.com Scanner 24/7 Aktif! 🚀"))
+			w.Write([]byte("Chess.com 3L Scanner 24/7 Aktif! 🚀"))
 		})
 		http.ListenAndServe(":"+port, nil)
 	}()
@@ -119,7 +116,7 @@ func main() {
 		cancel()
 	}()
 
-	fmt.Println("⚡ === CHESS.COM GÜVENLİ (LOW-RISK) TARAYICI BAŞLATILIYOR === ⚡")
+	fmt.Println("⚡ === CHESS.COM 3L (3 HANELİ) TARAYICI BAŞLATILIYOR === ⚡")
 	loadBlacklist()
 
 	if webhookURL != "" {
@@ -137,6 +134,7 @@ func main() {
 	case 3:
 		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-")
 	default:
+		// 4: İsimde kullanılabilen tüm karakterler (Harfler, rakamlar, tire ve alt çizgi)
 		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-_")
 	}
 
@@ -148,16 +146,15 @@ func main() {
 		endIdx = totalCombinations
 	}
 
-	fmt.Printf("Platform: Chess.com\n")
-	fmt.Printf("Hız: %d Thread (Güvenli Mod) | Kapsam: %d Karakter\n", threads, length)
-	fmt.Printf("🎯 Görev Dağılımı: Hedef %d isim\n", endIdx-startIdx)
+	fmt.Printf("Platform: Chess.com | Mod: Sadece 3 Haneli (3L)\n")
+	fmt.Printf("Hız: %d Thread | Kapsam: %d Karakter\n", threads, length)
+	fmt.Printf("🎯 Görev Dağılımı: Hedef %d kombinasyon\n", endIdx-startIdx)
 	if webhookURL != "" {
 		fmt.Println("🔔 Discord Webhook: AKTİF")
 	}
 	fmt.Printf("🛡️ Blacklist: %d kayıt yüklendi\n", len(blacklistMap))
 	fmt.Println("===========================================")
 
-	// Metrik izleyicisini başlat
 	go metricsTicker(ctx)
 
 	jobs := make(chan string, threads*2)
@@ -174,7 +171,7 @@ func main() {
 outerLoop:
 	for {
 		loopVal := currentLoop.Load()
-		fmt.Printf("\n🔄 --- [TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", loopVal)
+		fmt.Printf("\n🔄 --- [3L TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", loopVal)
 
 		for idx := startIdx; idx < endIdx; idx++ {
 			select {
@@ -195,7 +192,6 @@ outerLoop:
 	time.Sleep(2 * time.Second)
 }
 
-// metricsTicker canlı performansı konsola yazar
 func metricsTicker(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -232,7 +228,6 @@ func metricsTicker(ctx context.Context) {
 	}
 }
 
-// waitIfRateLimited global duraklatma süresine kadar bekler
 func waitIfRateLimited(ctx context.Context) {
 	for {
 		now := time.Now().UnixNano()
@@ -242,7 +237,6 @@ func waitIfRateLimited(ctx context.Context) {
 		}
 
 		sleepDur := time.Duration(pauseUntil - now)
-
 		timer := time.NewTimer(sleepDur)
 		select {
 		case <-ctx.Done():
@@ -254,7 +248,6 @@ func waitIfRateLimited(ctx context.Context) {
 	}
 }
 
-// updateGlobalPause yeni bir bekleme süresi set eder
 func updateGlobalPause(d time.Duration) {
 	pauseUntil := time.Now().Add(d).UnixNano()
 	for {
@@ -283,17 +276,21 @@ func getCombinations(length int, charset []byte) int64 {
 	return intPow(int64(len(charset)), int64(length))
 }
 
-// isValidChessName, Chess.com kullanıcı adı kurallarına göre bir ön filtreleme yapar
-// Gereksiz network requestlerini azaltır.
+// isValidChessName: Chess.com 3L kurallarına göre ismi doğrular
+// - Uzunluk kesinlikle 3 olmalı
+// - İlk ve son karakter harf veya rakam olmalı (- veya _ ile başlayamaz/bitemez)
+// - Yan yana özel karakter bulunduramaz
 func isValidChessName(name string) bool {
-	if len(name) < 3 || len(name) > 20 {
+	if len(name) != 3 {
 		return false
 	}
-	// Başta veya sonda tire/alt çizgi olamaz
-	if name[0] == '-' || name[0] == '_' || name[len(name)-1] == '-' || name[len(name)-1] == '_' {
+	first := name[0]
+	last := name[2]
+
+	if (first == '-' || first == '_') || (last == '-' || last == '_') {
 		return false
 	}
-	// Art arda gelen özel karakterler genellikle yasaktır
+
 	if strings.Contains(name, "--") || strings.Contains(name, "__") || strings.Contains(name, "-_") || strings.Contains(name, "_-") {
 		return false
 	}
@@ -306,7 +303,6 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 
 		waitIfRateLimited(ctx)
 
-		// Chess.com Pub API: Kullanıcı mevcutsa 200 döner, değilse 404 döner.
 		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.chess.com/pub/player/"+name, nil)
 		if err != nil {
 			continue
@@ -329,23 +325,17 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 		metricLatSum.Add(uint64(latency))
 		metricLatCount.Add(1)
 
-		// Body'yi tamamen oku ve kapat ki connection reuse yapılabilsin.
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			// Kullanıcı mevcut
 			results <- CheckResult{Name: name, Status: StatusUsed}
 			return
-
 		} else if resp.StatusCode == 404 {
-			// API 404 döndürüyorsa, kullanıcı henüz alınmamış/mevcut değildir
 			results <- CheckResult{Name: name, Status: StatusAvailable}
 			return
-
 		} else if resp.StatusCode == 429 {
 			metric429s.Add(1)
-
 			retryAfterStr := resp.Header.Get("Retry-After")
 			var pauseDuration time.Duration
 			if retryAfterStr != "" {
@@ -353,16 +343,12 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 					pauseDuration = time.Duration(retryAfter * float64(time.Second))
 				}
 			}
-
 			if pauseDuration <= 0 {
 				pauseDuration = 5 * time.Second
 			}
-
 			updateGlobalPause(pauseDuration + (250 * time.Millisecond))
-
 			attempt--
 			continue
-
 		} else if resp.StatusCode >= 500 {
 			metric5xxs.Add(1)
 			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
@@ -400,10 +386,10 @@ func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
 	return WebhookPayload{
 		Embeds: []WebhookEmbed{
 			{
-				Title:  "🎯 CHESS.COM USERNAME HIT",
+				Title:  "🎯 CHESS.COM 3L USERNAME HIT",
 				Color:  5763719,
 				Fields: fields,
-				Footer: WebhookFooter{Text: fmt.Sprintf("Username Scanner • Chess.com • Node %d", workerID)},
+				Footer: WebhookFooter{Text: fmt.Sprintf("Username Scanner • Chess.com 3L • Node %d", workerID)},
 			},
 		},
 	}
@@ -480,8 +466,6 @@ func evaluateName(name string) string {
 
 	if len(name) == 3 {
 		score += 2.0
-	} else if len(name) == 4 {
-		score += 1.0
 	}
 
 	if score > 10.0 {
@@ -499,7 +483,6 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 			if !ok {
 				return
 			}
-			// Chess.com özel kurallarına takılan isimi direkt reddet, API'ye gidip vakit kaybetme
 			if !isValidChessName(name) {
 				continue
 			}
@@ -511,7 +494,7 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 func resultHandler(ctx context.Context, results <-chan CheckResult) {
 	seenHits := make(map[string]struct{})
 
-	f, err := os.OpenFile("hits_chess.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("hits_chess_3l.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("Dosya açılamadı:", err)
 		return
