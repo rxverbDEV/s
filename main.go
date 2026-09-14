@@ -34,8 +34,8 @@ var (
 )
 
 var (
-	length     = getEnvInt("LENGTH", 4) // Chess.com için güvenli alt sınır genelde 3-4 karakterdir
-	charsetOpt = getEnvInt("CHARSET", 2)
+	length     = getEnvInt("LENGTH", 3)// Chess.com için güvenli alt sınır genelde 3-4 karakterdir
+	charsetOpt = getEnvInt("CHARSET", 4)
 	threads    = getEnvInt("THREADS", 1) // Güvenli başlangıç değeri. Çok artırmak 429'a neden olur.
 	workerID   = getEnvInt("WORKER_ID", 0)
 	totalNodes = getEnvInt("TOTAL_WORKERS", 1)
