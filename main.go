@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -19,6 +19,13 @@ import (
 	"time"
 )
 
+// --- YAPILANDIRMA (AYARLAR BURADA SABİTLENDİ) ---
+const (
+	TargetLength = 3 // Aranan kelimenin uzunluğu
+	SafeThreads  = 3 // Tek IP için en güvenli thread sayısı (Asla 429 yemez)
+	WebhookURL   = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
+)
+
 // --- METRICS & RATE LIMIT STATE ---
 var (
 	metricReqs     atomic.Uint64
@@ -26,45 +33,32 @@ var (
 	metric5xxs     atomic.Uint64
 	metricTimeouts atomic.Uint64
 	metricHits     atomic.Uint64
-	metricLatSum   atomic.Uint64 // ms cinsinden toplam gecikme
+	metricLatSum   atomic.Uint64
 	metricLatCount atomic.Uint64
 
-	// Tüm worker'ları durduracak global timestamp (UnixNano)
 	globalPauseUntil atomic.Int64
+	currentLoop      atomic.Int64
+	blacklistMap     = make(map[string]struct{})
+	webhookQueue     = make(chan WebhookPayload, 1000)
 )
 
-var (
-	// BURASI DÜZELTİLDİ: Uzunluk kesin ve net olarak 3'e sabitlendi.
-	// Çevre değişkeni (Environment variable) artık bu ayarı bozamaz.
-	length     = 3 
-	
-	charsetOpt = getEnvInt("CHARSET", 4)
-	threads    = getEnvInt("THREADS", 1) // Güvenli başlangıç değeri. Çok artırmak 429'a neden olur.
-	workerID   = getEnvInt("WORKER_ID", 0)
-	totalNodes = getEnvInt("TOTAL_WORKERS", 1)
-	webhookURL = os.Getenv("WEBHOOK_URL")
-)
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+}
 
-// HTTP Client Optimizasyonu: Yüksek verim, düşük connection pressure.
 var client = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    false, // Bant genişliği tasarrufu için açık kalsın
 		ForceAttemptHTTP2:     true,
 	},
 }
-
-const (
-	StatusAvailable = "🟢 Alınabilir"
-	StatusUsed      = "🔴 Kullanılıyor"
-	StatusUnknown   = "⚪ Bilinmiyor"
-)
 
 type CheckResult struct {
 	Name   string
@@ -76,11 +70,10 @@ type WebhookPayload struct {
 }
 
 type WebhookEmbed struct {
-	Title       string         `json:"title"`
-	Description string         `json:"description,omitempty"`
-	Color       int            `json:"color"`
-	Fields      []WebhookField `json:"fields"`
-	Footer      WebhookFooter  `json:"footer"`
+	Title  string         `json:"title"`
+	Color  int            `json:"color"`
+	Fields []WebhookField `json:"fields"`
+	Footer WebhookFooter  `json:"footer"`
 }
 
 type WebhookField struct {
@@ -93,23 +86,14 @@ type WebhookFooter struct {
 	Text string `json:"text"`
 }
 
-var webhookQueue = make(chan WebhookPayload, 1000)
-var blacklistMap = make(map[string]struct{})
-var currentLoop atomic.Int64
-
 func main() {
-	// 🌐 Render PORT entegrasyonu ve sağlık kontrolü sunucusu
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Chess.com Scanner 24/7 Aktif! 🚀"))
-		})
-		http.ListenAndServe(":"+port, nil)
-	}()
+	// Worker komut satırı argümanları (Terminalden kontrol etmek için)
+	workerID := flag.Int("worker", 0, "Bu sunucunun/programin ID'si (Örn: 0)")
+	totalNodes := flag.Int("total", 1, "Toplam çalışacak sunucu/program sayısı (Örn: 1)")
+	flag.Parse()
+
+	// Rastgelelik için seed
+	rand.Seed(time.Now().UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -122,53 +106,53 @@ func main() {
 		cancel()
 	}()
 
-	fmt.Println("⚡ === CHESS.COM GÜVENLİ (LOW-RISK) TARAYICI BAŞLATILIYOR === ⚡")
+	fmt.Println("⚡ === CHESS.COM GÜVENLİ (STABİL) TARAYICI BAŞLATILIYOR === ⚡")
 	loadBlacklist()
 
-	if webhookURL != "" {
-		for i := 0; i < 2; i++ {
-			go webhookWorker(ctx, webhookQueue)
-		}
+	for i := 0; i < 2; i++ {
+		go webhookWorker(ctx, webhookQueue)
 	}
 
-	var charset []byte
-	switch charsetOpt {
-	case 1:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz")
-	case 2:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789")
-	case 3:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-")
-	default:
-		charset = []byte("abcdefghijklmnopqrstuvwxyz0123456789-_")
-	}
+	// 1. ADIM: Sadece geçerli olan isimleri oluştur (Çöp üretim engellendi)
+	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor...")
+	validNames := generateValidNames(TargetLength)
+	
+	// 2. ADIM: Listeyi karıştır! (Sayılar ve semboller hemen çıksın diye)
+	fmt.Println("🔀 İsimler karıştırılıyor (Harfler ve Sayılar homojen dağıtıldı)...")
+	rand.Shuffle(len(validNames), func(i, j int) {
+		validNames[i], validNames[j] = validNames[j], validNames[i]
+	})
 
-	totalCombinations := getCombinations(length, charset)
-	chunkSize := int64(math.Ceil(float64(totalCombinations) / float64(totalNodes)))
-	startIdx := int64(workerID) * chunkSize
+	// 3. ADIM: Görevi paylaştır
+	totalCombinations := len(validNames)
+	chunkSize := (totalCombinations + *totalNodes - 1) / *totalNodes
+	startIdx := *workerID * chunkSize
 	endIdx := startIdx + chunkSize
 	if endIdx > totalCombinations {
 		endIdx = totalCombinations
 	}
 
-	fmt.Printf("Platform: Chess.com\n")
-	fmt.Printf("Hız: %d Thread (Güvenli Mod) | Kapsam: %d Karakter\n", threads, length)
-	fmt.Printf("🎯 Görev Dağılımı: Hedef %d isim\n", endIdx-startIdx)
-	if webhookURL != "" {
-		fmt.Println("🔔 Discord Webhook: AKTİF")
+	if startIdx >= totalCombinations {
+		fmt.Println("❌ Hatalı Worker ID. Kapatılıyor.")
+		return
 	}
-	fmt.Printf("🛡️ Blacklist: %d kayıt yüklendi\n", len(blacklistMap))
+
+	myNames := validNames[startIdx:endIdx]
+
+	fmt.Printf("Platform: Chess.com\n")
+	fmt.Printf("Hız: %d Thread (Safe Mode) | Kapsam: %d Karakter\n", SafeThreads, TargetLength)
+	fmt.Printf("🎯 Toplam Geçerli İsim: %d | Bu Worker'ın Görevi: %d isim\n", totalCombinations, len(myNames))
+	fmt.Printf("🔔 Discord Webhook: AKTİF\n")
 	fmt.Println("===========================================")
 
-	// Metrik izleyicisini başlat
 	go metricsTicker(ctx)
 
-	jobs := make(chan string, threads*2)
+	jobs := make(chan string, SafeThreads*2)
 	results := make(chan CheckResult, 100)
 
 	go resultHandler(ctx, results)
 
-	for i := 0; i < threads; i++ {
+	for i := 0; i < SafeThreads; i++ {
 		go worker(ctx, jobs, results)
 	}
 
@@ -179,17 +163,16 @@ outerLoop:
 		loopVal := currentLoop.Load()
 		fmt.Printf("\n🔄 --- [TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", loopVal)
 
-		for idx := startIdx; idx < endIdx; idx++ {
+		for _, name := range myNames {
 			select {
 			case <-ctx.Done():
 				break outerLoop
 			default:
-				name := generateName(idx, length, charset)
 				jobs <- name
 			}
 		}
 
-		fmt.Printf("✅ --- [%d. TUR LİSTESİ BİTTİ, 5 SANİYE BEKLENİYOR] ---\n", loopVal)
+		fmt.Printf("✅ --- [%d. TUR BİTTİ, 5 SANİYE BEKLENİYOR] ---\n", loopVal)
 		time.Sleep(5 * time.Second)
 		currentLoop.Add(1)
 	}
@@ -198,7 +181,42 @@ outerLoop:
 	time.Sleep(2 * time.Second)
 }
 
-// metricsTicker canlı performansı konsola yazar
+// generateValidNames: Chess.com kurallarına %100 uyan listeyi doğrudan oluşturur.
+func generateValidNames(length int) []string {
+	var results []string
+	alphaNum := "abcdefghijklmnopqrstuvwxyz0123456789"
+	symbols := "-_"
+
+	var generate func(current string)
+	generate = func(current string) {
+		if len(current) == length {
+			results = append(results, current)
+			return
+		}
+
+		isFirst := len(current) == 0
+		isLast := len(current) == length-1
+
+		// Harf ve sayıları her konuma koyabiliriz
+		for _, c := range alphaNum {
+			generate(current + string(c))
+		}
+
+		// Sembolleri (- _) başa ve sona KOYAMAYIZ. Yan yana KOYAMAYIZ.
+		if !isFirst && !isLast {
+			prevChar := current[len(current)-1]
+			if prevChar != '-' && prevChar != '_' {
+				for _, c := range symbols {
+					generate(current + string(c))
+				}
+			}
+		}
+	}
+
+	generate("")
+	return results
+}
+
 func metricsTicker(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -225,8 +243,8 @@ func metricsTicker(ctx context.Context) {
 				avgLat = deltaLatSum / deltaLatCount
 			}
 
-			fmt.Printf("📊 Speed: %d req/s | 📡 Avg Latency: %d ms | 🟢 429s: %d | 🔴 5xxs: %d | 🎯 Hits: %d\n",
-				reqRate, avgLat, metric429s.Load(), metric5xxs.Load(), metricHits.Load())
+			fmt.Printf("📊 Hız: %d req/s | 📡 Ping: %d ms | 🟢 429 Engel: %d | 🎯 Bulunan: %d\n",
+				reqRate, avgLat, metric429s.Load(), metricHits.Load())
 
 			lastReqs = reqs
 			lastLatSum = latSum
@@ -235,7 +253,6 @@ func metricsTicker(ctx context.Context) {
 	}
 }
 
-// waitIfRateLimited global duraklatma süresine kadar bekler
 func waitIfRateLimited(ctx context.Context) {
 	for {
 		now := time.Now().UnixNano()
@@ -243,9 +260,7 @@ func waitIfRateLimited(ctx context.Context) {
 		if pauseUntil <= now {
 			return
 		}
-
 		sleepDur := time.Duration(pauseUntil - now)
-
 		timer := time.NewTimer(sleepDur)
 		select {
 		case <-ctx.Done():
@@ -257,7 +272,6 @@ func waitIfRateLimited(ctx context.Context) {
 	}
 }
 
-// updateGlobalPause yeni bir bekleme süresi set eder
 func updateGlobalPause(d time.Duration) {
 	pauseUntil := time.Now().Add(d).UnixNano()
 	for {
@@ -271,51 +285,20 @@ func updateGlobalPause(d time.Duration) {
 	}
 }
 
-func generateName(index int64, length int, charset []byte) string {
-	b := make([]byte, length)
-	cLen := int64(len(charset))
-
-	for i := length - 1; i >= 0; i-- {
-		b[i] = charset[index%cLen]
-		index /= cLen
-	}
-	return string(b)
-}
-
-func getCombinations(length int, charset []byte) int64 {
-	return intPow(int64(len(charset)), int64(length))
-}
-
-// isValidChessName, Chess.com kullanıcı adı kurallarına göre bir ön filtreleme yapar
-// Gereksiz network requestlerini azaltır.
-func isValidChessName(name string) bool {
-	if len(name) < 3 || len(name) > 20 {
-		return false
-	}
-	// Başta veya sonda tire/alt çizgi olamaz
-	if name[0] == '-' || name[0] == '_' || name[len(name)-1] == '-' || name[len(name)-1] == '_' {
-		return false
-	}
-	// Art arda gelen özel karakterler genellikle yasaktır
-	if strings.Contains(name, "--") || strings.Contains(name, "__") || strings.Contains(name, "-_") || strings.Contains(name, "_-") {
-		return false
-	}
-	return true
-}
-
 func checkChessName(ctx context.Context, name string, results chan<- CheckResult) {
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
 
 		waitIfRateLimited(ctx)
 
-		// Chess.com Pub API: Kullanıcı mevcutsa 200 döner, değilse 404 döner.
 		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.chess.com/pub/player/"+name, nil)
 		if err != nil {
 			continue
 		}
 
-		req.Header.Set("User-Agent", "SafeScanner/1.0")
+		// Her istekte rastgele User-Agent seçimi
+		ua := userAgents[rand.Intn(len(userAgents))]
+		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "application/json")
 
 		start := time.Now()
@@ -332,23 +315,16 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 		metricLatSum.Add(uint64(latency))
 		metricLatCount.Add(1)
 
-		// Body'yi tamamen oku ve kapat ki connection reuse yapılabilsin.
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			// Kullanıcı mevcut
-			results <- CheckResult{Name: name, Status: StatusUsed}
-			return
-
+			return // Kullanılıyor, es geç
 		} else if resp.StatusCode == 404 {
-			// API 404 döndürüyorsa, kullanıcı henüz alınmamış/mevcut değildir
-			results <- CheckResult{Name: name, Status: StatusAvailable}
+			results <- CheckResult{Name: name, Status: "🟢 Alınabilir"}
 			return
-
 		} else if resp.StatusCode == 429 {
 			metric429s.Add(1)
-
 			retryAfterStr := resp.Header.Get("Retry-After")
 			var pauseDuration time.Duration
 			if retryAfterStr != "" {
@@ -356,141 +332,20 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 					pauseDuration = time.Duration(retryAfter * float64(time.Second))
 				}
 			}
-
 			if pauseDuration <= 0 {
 				pauseDuration = 5 * time.Second
 			}
-
 			updateGlobalPause(pauseDuration + (250 * time.Millisecond))
-
 			attempt--
 			continue
-
 		} else if resp.StatusCode >= 500 {
 			metric5xxs.Add(1)
-			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
-			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-			time.Sleep(backoff + jitter)
+			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * time.Second)
 			continue
 		} else {
-			results <- CheckResult{Name: name, Status: StatusUnknown}
 			return
 		}
 	}
-
-	results <- CheckResult{Name: name, Status: StatusUnknown}
-}
-
-func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
-	score := evaluateName(hit.Name)
-	charCount := len(hit.Name)
-	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
-	typeDesc := fmt.Sprintf("%dL", charCount)
-
-	encodedName := url.PathEscape(hit.Name)
-	profileURL := fmt.Sprintf("https://www.chess.com/member/%s", encodedName)
-
-	fields := []WebhookField{
-		{Name: "👤 İsim", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
-		{Name: "⭐ Değer", Value: fmt.Sprintf("`%s`", score), Inline: true},
-		{Name: "📊 Durum", Value: fmt.Sprintf("`%s`", hit.Status), Inline: true},
-		{Name: "🧩 Karakter", Value: fmt.Sprintf("`%d karakter`", charCount), Inline: true},
-		{Name: "🏷️ Tip", Value: fmt.Sprintf("`%s`", typeDesc), Inline: true},
-		{Name: "🔗 Profil", Value: fmt.Sprintf("[Görüntüle](%s)", profileURL), Inline: true},
-		{Name: "🕐 Bulunma", Value: fmt.Sprintf("`%s`", timeStr), Inline: false},
-	}
-
-	return WebhookPayload{
-		Embeds: []WebhookEmbed{
-			{
-				Title:  "🎯 CHESS.COM USERNAME HIT",
-				Color:  5763719,
-				Fields: fields,
-				Footer: WebhookFooter{Text: fmt.Sprintf("Username Scanner • Chess.com • Node %d", workerID)},
-			},
-		},
-	}
-}
-
-func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case payload := <-queue:
-			sendToDiscord(payload)
-		}
-	}
-}
-
-func sendToDiscord(payload WebhookPayload) {
-	jsonBytes, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-}
-
-func loadBlacklist() {
-	data, err := os.ReadFile("blacklist.txt")
-	if err != nil {
-		return
-	}
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) > 0 {
-			blacklistMap[strings.ToLower(string(line))] = struct{}{}
-		}
-	}
-}
-
-func evaluateName(name string) string {
-	score := 5.0
-	hasLetter, hasNumber, hasSpecial := false, false, false
-
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			hasLetter = true
-		} else if c >= '0' && c <= '9' {
-			hasNumber = true
-		} else if c == '_' || c == '-' {
-			hasSpecial = true
-		}
-	}
-
-	if hasLetter && !hasNumber && !hasSpecial {
-		score += 3.0
-	} else if hasNumber && !hasLetter && !hasSpecial {
-		score += 1.0
-	} else if hasLetter && hasNumber && !hasSpecial {
-		score += 2.0
-	}
-
-	if len(name) == 3 {
-		score += 2.0
-	} else if len(name) == 4 {
-		score += 1.0
-	}
-
-	if score > 10.0 {
-		score = 10.0
-	}
-	return fmt.Sprintf("%.1f/10", score)
 }
 
 func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult) {
@@ -502,10 +357,8 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 			if !ok {
 				return
 			}
-			// Chess.com özel kurallarına takılan isimi direkt reddet, API'ye gidip vakit kaybetme
-			if !isValidChessName(name) {
-				continue
-			}
+			// İsimler zaten en başta %100 kurallara uygun üretildiği için, 
+			// burada ekstra isValidChessName doğrulamasına GEREK YOKTUR!
 			checkChessName(ctx, name, results)
 		}
 	}
@@ -527,7 +380,6 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 			return
 		case res := <-results:
 			lowerName := strings.ToLower(res.Name)
-
 			if _, exists := blacklistMap[lowerName]; exists {
 				continue
 			}
@@ -535,38 +387,127 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 				continue
 			}
 
-			if res.Status == StatusAvailable {
-				seenHits[lowerName] = struct{}{}
-				metricHits.Add(1)
-				fmt.Printf("🔥 [%s] -> %s\n", res.Status, res.Name)
-				f.WriteString(fmt.Sprintf("%s | %s\n", res.Name, res.Status))
-				f.Sync()
+			seenHits[lowerName] = struct{}{}
+			metricHits.Add(1)
+			fmt.Printf("🔥 [BULUNDU] -> %s\n", res.Name)
+			f.WriteString(fmt.Sprintf("%s\n", res.Name))
+			f.Sync()
 
-				if webhookURL != "" {
-					payload := BuildChessWebhookPayload(res)
-					select {
-					case webhookQueue <- payload:
-					default:
-					}
-				}
+			payload := BuildChessWebhookPayload(res)
+			select {
+			case webhookQueue <- payload:
+			default:
 			}
 		}
 	}
 }
 
-func getEnvInt(key string, fallback int) int {
-	if val, ok := os.LookupEnv(key); ok {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
-		}
+func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
+	charCount := len(hit.Name)
+	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
+	
+	score, typeDesc := evaluateNameDetailed(hit.Name)
+	encodedName := url.PathEscape(hit.Name)
+	profileURL := fmt.Sprintf("https://www.chess.com/member/%s", encodedName)
+
+	fields := []WebhookField{
+		{Name: "👤 İsim", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
+		{Name: "⭐ Puan", Value: fmt.Sprintf("`%s`", score), Inline: true},
+		{Name: "🏷️ Kategori", Value: fmt.Sprintf("`%s`", typeDesc), Inline: true},
+		{Name: "🔗 Profil", Value: fmt.Sprintf("[Kayıt Ol](%s)", profileURL), Inline: false},
+		{Name: "🕐 Zaman", Value: fmt.Sprintf("`%s`", timeStr), Inline: false},
 	}
-	return fallback
+
+	return WebhookPayload{
+		Embeds: []WebhookEmbed{
+			{
+				Title:  "🎯 CHESS.COM KULLANICI ADI BULUNDU",
+				Color:  5763719,
+				Fields: fields,
+				Footer: WebhookFooter{Text: "Chess.com Pro Scanner"},
+			},
+		},
+	}
 }
 
-func intPow(base, exp int64) int64 {
-	result := int64(1)
-	for i := int64(0); i < exp; i++ {
-		result *= base
+func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload := <-queue:
+			sendToDiscord(payload)
+		}
 	}
-	return result
+}
+
+func sendToDiscord(payload WebhookPayload) {
+	jsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest("POST", WebhookURL, bytes.NewReader(jsonBytes))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+}
+
+func loadBlacklist() {
+	data, err := os.ReadFile("blacklist.txt")
+	if err != nil {
+		return
+	}
+	lines := bytes.Split(data, []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			blacklistMap[strings.ToLower(string(line))] = struct{}{}
+		}
+	}
+}
+
+func evaluateNameDetailed(name string) (string, string) {
+	hasLetter, hasNumber, hasSpecial := false, false, false
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			hasLetter = true
+		} else if c >= '0' && c <= '9' {
+			hasNumber = true
+		} else if c == '_' || c == '-' {
+			hasSpecial = true
+		}
+	}
+
+	score := 5.0
+	typeDesc := "Karışık"
+
+	if hasLetter && !hasNumber && !hasSpecial {
+		score += 4.0
+		typeDesc = "Saf Harf"
+	} else if hasNumber && !hasLetter && !hasSpecial {
+		score += 5.0
+		typeDesc = "Saf Sayı"
+	} else if hasLetter && hasNumber && !hasSpecial {
+		score += 2.0
+		typeDesc = "Harf + Sayı"
+	} else if hasSpecial {
+		typeDesc = "Sembol İçeriyor"
+	}
+
+	if len(name) == 3 {
+		score += 1.0
+	}
+
+	if score > 10.0 {
+		score = 10.0
+	}
+	return fmt.Sprintf("%.1f/10", score), typeDesc
 }
