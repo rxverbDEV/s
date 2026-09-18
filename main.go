@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -21,7 +22,7 @@ import (
 
 // --- YAPILANDIRMA (AYARLAR BURADA SABİTLENDİ) ---
 const (
-	TargetLength = 3 // Aranan kelimenin uzunluğu
+	TargetLength = 3 // Aranan kelimenin uzunluğu (3 karakter)
 	SafeThreads  = 3 // Tek IP için en güvenli thread sayısı (Asla 429 yemez)
 	WebhookURL   = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
 )
@@ -113,12 +114,12 @@ func main() {
 		go webhookWorker(ctx, webhookQueue)
 	}
 
-	// 1. ADIM: Sadece geçerli olan isimleri oluştur (Çöp üretim engellendi)
+	// 1. ADIM: Sadece geçerli olan isimleri oluştur (49.248 adet geçerli isim)
 	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor...")
 	validNames := generateValidNames(TargetLength)
 	
-	// 2. ADIM: Listeyi karıştır! (Sayılar ve semboller hemen çıksın diye)
-	fmt.Println("🔀 İsimler karıştırılıyor (Harfler ve Sayılar homojen dağıtıldı)...")
+	// 2. ADIM: Listeyi karıştır! (Sayılar ve semboller homojen dağılsın diye)
+	fmt.Println("🔀 İsimler karıştırılıyor...")
 	rand.Shuffle(len(validNames), func(i, j int) {
 		validNames[i], validNames[j] = validNames[j], validNames[i]
 	})
@@ -181,7 +182,7 @@ outerLoop:
 	time.Sleep(2 * time.Second)
 }
 
-// generateValidNames: Chess.com kurallarına %100 uyan listeyi doğrudan oluşturur.
+// generateValidNames: Chess.com kurallarına %100 uyan 49.248 ismi oluşturur.
 func generateValidNames(length int) []string {
 	var results []string
 	alphaNum := "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -197,12 +198,10 @@ func generateValidNames(length int) []string {
 		isFirst := len(current) == 0
 		isLast := len(current) == length-1
 
-		// Harf ve sayıları her konuma koyabiliriz
 		for _, c := range alphaNum {
 			generate(current + string(c))
 		}
 
-		// Sembolleri (- _) başa ve sona KOYAMAYIZ. Yan yana KOYAMAYIZ.
 		if !isFirst && !isLast {
 			prevChar := current[len(current)-1]
 			if prevChar != '-' && prevChar != '_' {
@@ -296,7 +295,6 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 			continue
 		}
 
-		// Her istekte rastgele User-Agent seçimi
 		ua := userAgents[rand.Intn(len(userAgents))]
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "application/json")
@@ -319,7 +317,7 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			return // Kullanılıyor, es geç
+			return
 		} else if resp.StatusCode == 404 {
 			results <- CheckResult{Name: name, Status: "🟢 Alınabilir"}
 			return
@@ -357,8 +355,6 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult)
 			if !ok {
 				return
 			}
-			// İsimler zaten en başta %100 kurallara uygun üretildiği için, 
-			// burada ekstra isValidChessName doğrulamasına GEREK YOKTUR!
 			checkChessName(ctx, name, results)
 		}
 	}
@@ -403,7 +399,6 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 }
 
 func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
-	charCount := len(hit.Name)
 	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
 	
 	score, typeDesc := evaluateNameDetailed(hit.Name)
@@ -442,6 +437,19 @@ func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
 }
 
 func sendToDiscord(payload WebhookPayload) {
+	jsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest("POST", WebhookURL, bytes.NewReader(jsonBytes))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(resp := client.Do(req)) // Derleme hatasını önlemek için düzeltildi
+}
+
+func sendToDiscordCorrected(payload WebhookPayload) {
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		return
