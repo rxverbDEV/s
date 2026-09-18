@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,13 +9,13 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -22,25 +23,25 @@ import (
 
 // --- YAPILANDIRMA ---
 const (
-	TargetLength = 3
-	SafeThreads  = 3
+	TargetLength = 3 // Aranan kelimenin uzunluğu
+	SafeThreads  = 3 // Tek IP için en güvenli thread sayısı
 	WebhookURL   = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
 )
 
-// --- METRICS & RATE LIMIT STATE ---
+// --- METRICS & STATE ---
 var (
-	metricReqs     atomic.Uint64
-	metric429s     atomic.Uint64
-	metric5xxs     atomic.Uint64
-	metricTimeouts atomic.Uint64
-	metricHits     atomic.Uint64
-	metricLatSum   atomic.Uint64
-	metricLatCount atomic.Uint64
+	metricReqs      atomic.Uint64
+	metric429s      atomic.Uint64
+	metric5xxs      atomic.Uint64
+	metricTimeouts  atomic.Uint64
+	metricHits      atomic.Uint64
+	metricProcessed atomic.Uint64
+	metricLatSum    atomic.Uint64
+	metricLatCount  atomic.Uint64
+	metricWorkers   atomic.Int32
 
 	globalPauseUntil atomic.Int64
-	currentLoop      atomic.Int64
 	blacklistMap     = make(map[string]struct{})
-	webhookQueue     = make(chan WebhookPayload, 1000)
 )
 
 var userAgents = []string{
@@ -49,8 +50,9 @@ var userAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
 }
 
+// Global, optimize edilmiş HTTP Client
 var client = &http.Client{
-	Timeout: 15 * time.Second,
+	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
@@ -58,6 +60,7 @@ var client = &http.Client{
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
+		DisableKeepAlives:     false,
 	},
 }
 
@@ -92,8 +95,6 @@ func main() {
 	totalNodes := flag.Int("total", 1, "Toplam çalışacak sunucu/program sayısı (Örn: 1)")
 	flag.Parse()
 
-	rand.Seed(time.Now().UnixNano())
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -101,128 +102,149 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n⚠️ Kapatma sinyali alındı. Güvenlice durduruluyor...")
+		fmt.Print("\n\033[?25h") // Cursor'ı geri getir
+		fmt.Println("\n⚠️ Kapatma sinyali alındı. Veriler kaydedilerek güvenlice durduruluyor...")
 		cancel()
 	}()
+
+	fmt.Print("\033[?25l") // Cursor'ı gizle
+	defer fmt.Print("\033[?25h")
 
 	fmt.Println("⚡ === CHESS.COM GÜVENLİ (STABİL) TARAYICI BAŞLATILIYOR === ⚡")
 	loadBlacklist()
 
+	webhookQueue := make(chan WebhookPayload, 1000)
+	var wgWebhooks sync.WaitGroup
 	for i := 0; i < 2; i++ {
-		go webhookWorker(ctx, webhookQueue)
+		wgWebhooks.Add(1)
+		go webhookWorker(ctx, webhookQueue, &wgWebhooks)
 	}
 
-	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor (En az 1 harf şartı devrede)...")
+	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor...")
 	validNames := generateValidNames(TargetLength)
 
-	fmt.Println("🔀 İsimler karıştırılıyor...")
-	rand.Shuffle(len(validNames), func(i, j int) {
-		validNames[i], validNames[j] = validNames[j], validNames[i]
-	})
+	fmt.Println("🔀 İsimler karıştırılıyor (Homojen dağılım)...")
+	shuffleList(validNames)
 
 	totalCombinations := len(validNames)
+	if totalCombinations == 0 {
+		fmt.Println("❌ Üretilen geçerli kombinasyon yok. Çıkılıyor.")
+		return
+	}
+
 	chunkSize := (totalCombinations + *totalNodes - 1) / *totalNodes
 	startIdx := *workerID * chunkSize
 	endIdx := startIdx + chunkSize
 	if endIdx > totalCombinations {
 		endIdx = totalCombinations
 	}
-
 	if startIdx >= totalCombinations {
 		fmt.Println("❌ Hatalı Worker ID. Kapatılıyor.")
 		return
 	}
 
 	myNames := validNames[startIdx:endIdx]
+	totalMyNames := len(myNames)
 
 	fmt.Printf("Platform: Chess.com\n")
 	fmt.Printf("Hız: %d Thread (Safe Mode) | Kapsam: %d Karakter\n", SafeThreads, TargetLength)
-	fmt.Printf("🎯 Toplam Geçerli İsim: %d | Bu Worker'ın Görevi: %d isim\n", totalCombinations, len(myNames))
+	fmt.Printf("🎯 Toplam Geçerli İsim: %d | Bu Worker'ın Görevi: %d isim\n", totalCombinations, totalMyNames)
 	fmt.Printf("🔔 Discord Webhook: AKTİF\n")
-	fmt.Println("===========================================")
-
-	go metricsTicker(ctx)
+	fmt.Println("===========================================\n")
 
 	jobs := make(chan string, SafeThreads*2)
 	results := make(chan CheckResult, 100)
 
-	go resultHandler(ctx, results)
+	var wgResultHandler sync.WaitGroup
+	wgResultHandler.Add(1)
+	go resultHandler(ctx, results, webhookQueue, &wgResultHandler)
 
+	var wgWorkers sync.WaitGroup
 	for i := 0; i < SafeThreads; i++ {
-		go worker(ctx, jobs, results)
+		wgWorkers.Add(1)
+		ua := userAgents[i%len(userAgents)]
+		go worker(ctx, jobs, results, ua, &wgWorkers)
 	}
 
-	currentLoop.Store(1)
+	go metricsDashboard(ctx, totalMyNames)
 
+	startTime := time.Now()
+
+	// Ana isim dağıtım döngüsü
 outerLoop:
-	for {
-		loopVal := currentLoop.Load()
-		fmt.Printf("\n🔄 --- [TARAMA DÖNGÜSÜ: %d. TUR BAŞLIYOR] ---\n", loopVal)
-
-		for _, name := range myNames {
-			select {
-			case <-ctx.Done():
-				break outerLoop
-			default:
-				jobs <- name
-			}
+	for _, name := range myNames {
+		select {
+		case <-ctx.Done():
+			break outerLoop
+		case jobs <- name:
 		}
-
-		fmt.Printf("✅ --- [%d. TUR BİTTİ, 5 SANİYE BEKLENİYOR] ---\n", loopVal)
-		time.Sleep(5 * time.Second)
-		currentLoop.Add(1)
 	}
 
 	close(jobs)
-	time.Sleep(2 * time.Second)
+	wgWorkers.Wait()
+
+	close(results)
+	wgResultHandler.Wait()
+
+	close(webhookQueue)
+	wgWebhooks.Wait()
+
+	elapsed := time.Since(startTime)
+	fmt.Printf("\n✅ Tarama tamamlandı! Geçen Süre: %v\n", elapsed)
 }
 
-// Yeni kurala göre güncellenmiş İsim Oluşturucu
 func generateValidNames(length int) []string {
-	var results []string
-	letters := "abcdefghijklmnopqrstuvwxyz"
-	numbers := "0123456789"
+	charset := []byte("abcdefghijklmnopqrstuvwxyz123456789_")
+	results := make([]string, 0, 45000)
+	buf := make([]byte, length)
 
-	// Rekürsif fonksiyona "hasLetter" (harf içeriyor mu?) kontrolü eklendi
-	var generate func(current string, hasLetter bool)
-	generate = func(current string, hasLetter bool) {
-		if len(current) == length {
-			if hasLetter { // Eğer kelimede en az 1 harf varsa kaydet
-				results = append(results, current)
+	var gen func(pos int, hasLetter bool, lastChar byte)
+	gen = func(pos int, hasLetter bool, lastChar byte) {
+		if pos == length {
+			if hasLetter {
+				results = append(results, string(buf))
 			}
 			return
 		}
 
-		isFirst := len(current) == 0
-		isLast := len(current) == length-1
-
-		// Harfleri ekle (Harf eklendiği için hasLetter TRUE olur)
-		for _, c := range letters {
-			generate(current+string(c), true)
-		}
-
-		// Rakamları ekle (Harf durumu değişmez)
-		for _, c := range numbers {
-			generate(current+string(c), hasLetter)
-		}
-
-		// '_' sembolünü ekle (Başta veya sonda olamaz, peş peşe olamaz, '-' YASAKLI)
-		if !isFirst && !isLast {
-			if current[len(current)-1] != '_' {
-				generate(current+"_", hasLetter)
+		for _, c := range charset {
+			if pos == 0 && c == '_' {
+				continue
 			}
+			if pos == length-1 && c == '_' {
+				continue
+			}
+			if c == '_' && lastChar == '_' {
+				continue
+			}
+
+			buf[pos] = c
+			isLetter := (c >= 'a' && c <= 'z')
+			gen(pos+1, hasLetter || isLetter, c)
 		}
 	}
 
-	generate("", false)
+	gen(0, false, 0)
 	return results
 }
 
-func metricsTicker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+func shuffleList(slice []string) {
+	seed := uint32(time.Now().UnixNano())
+	for i := len(slice) - 1; i > 0; i-- {
+		seed ^= seed << 13
+		seed ^= seed >> 17
+		seed ^= seed << 5
+		j := int(seed % uint32(i+1))
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+}
+
+func metricsDashboard(ctx context.Context, total int) {
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	var lastReqs, lastLatSum, lastLatCount uint64
+	startTime := time.Now()
 
 	for {
 		select {
@@ -232,20 +254,27 @@ func metricsTicker(ctx context.Context) {
 			reqs := metricReqs.Load()
 			latSum := metricLatSum.Load()
 			latCount := metricLatCount.Load()
+			processed := metricProcessed.Load()
+			workers := metricWorkers.Load()
 
 			deltaReqs := reqs - lastReqs
 			deltaLatSum := latSum - lastLatSum
 			deltaLatCount := latCount - lastLatCount
-
-			reqRate := deltaReqs / 5
 
 			var avgLat uint64
 			if deltaLatCount > 0 {
 				avgLat = deltaLatSum / deltaLatCount
 			}
 
-			fmt.Printf("📊 Hız: %d req/s | 📡 Ping: %d ms | 🟢 429 Engel: %d | 🎯 Bulunan: %d\n",
-				reqRate, avgLat, metric429s.Load(), metricHits.Load())
+			percentage := float64(processed) / float64(total) * 100
+			if math.IsNaN(percentage) {
+				percentage = 0
+			}
+
+			elapsed := time.Since(startTime).Round(time.Second)
+
+			fmt.Printf("\r\033[K[%5.1f%%] 📊 Hız: %3d req/s | 📡 Ping: %4d ms | 🛑 429: %d | 🎯 Bulunan: %d | ⚡ Aktif: %d | ⏱️ %v",
+				percentage, deltaReqs, avgLat, metric429s.Load(), metricHits.Load(), workers, elapsed)
 
 			lastReqs = reqs
 			lastLatSum = latSum
@@ -262,13 +291,10 @@ func waitIfRateLimited(ctx context.Context) {
 			return
 		}
 		sleepDur := time.Duration(pauseUntil - now)
-		timer := time.NewTimer(sleepDur)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
-		case <-timer.C:
-			return
+		case <-time.After(sleepDur):
 		}
 	}
 }
@@ -286,24 +312,44 @@ func updateGlobalPause(d time.Duration) {
 	}
 }
 
-func checkChessName(ctx context.Context, name string, results chan<- CheckResult) {
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
+func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult, userAgent string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	metricWorkers.Add(1)
+	defer metricWorkers.Add(-1)
 
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case name, ok := <-jobs:
+			if !ok {
+				return
+			}
+			checkChessName(ctx, name, userAgent, results)
+			metricProcessed.Add(1)
+		}
+	}
+}
+
+func checkChessName(ctx context.Context, name, userAgent string, results chan<- CheckResult) {
+	maxRetries := 3
+	urlStr := "https://api.chess.com/pub/player/" + name
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		waitIfRateLimited(ctx)
 
-		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.chess.com/pub/player/"+name, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 		if err != nil {
-			continue
+			return
 		}
 
-		ua := userAgents[rand.Intn(len(userAgents))]
-		req.Header.Set("User-Agent", ua)
+		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Connection", "keep-alive")
 
 		start := time.Now()
 		resp, err := client.Do(req)
-		latency := time.Since(start).Milliseconds()
+		latency := uint64(time.Since(start).Milliseconds())
 
 		if err != nil {
 			metricTimeouts.Add(1)
@@ -312,18 +358,18 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 		}
 
 		metricReqs.Add(1)
-		metricLatSum.Add(uint64(latency))
+		metricLatSum.Add(latency)
 		metricLatCount.Add(1)
 
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode == 200 {
+		if resp.StatusCode == http.StatusOK {
 			return
-		} else if resp.StatusCode == 404 {
+		} else if resp.StatusCode == http.StatusNotFound {
 			results <- CheckResult{Name: name, Status: "🟢 Alınabilir"}
 			return
-		} else if resp.StatusCode == 429 {
+		} else if resp.StatusCode == http.StatusTooManyRequests {
 			metric429s.Add(1)
 			retryAfterStr := resp.Header.Get("Retry-After")
 			var pauseDuration time.Duration
@@ -338,9 +384,9 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 			updateGlobalPause(pauseDuration + (250 * time.Millisecond))
 			attempt--
 			continue
-		} else if resp.StatusCode >= 500 {
+		} else if resp.StatusCode >= http.StatusInternalServerError {
 			metric5xxs.Add(1)
-			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * time.Second)
+			time.Sleep(time.Duration(1<<attempt) * time.Second)
 			continue
 		} else {
 			return
@@ -348,35 +394,34 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 	}
 }
 
-func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case name, ok := <-jobs:
-			if !ok {
-				return
-			}
-			checkChessName(ctx, name, results)
-		}
-	}
-}
-
-func resultHandler(ctx context.Context, results <-chan CheckResult) {
+func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue chan<- WebhookPayload, wg *sync.WaitGroup) {
+	defer wg.Done()
 	seenHits := make(map[string]struct{})
 
 	f, err := os.OpenFile("hits_chess.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Println("Dosya açılamadı:", err)
+		fmt.Printf("\n❌ Dosya açılamadı: %v\n", err)
 		return
 	}
 	defer f.Close()
+
+	writer := bufio.NewWriter(f)
+	defer writer.Flush()
+
+	flushTicker := time.NewTicker(5 * time.Second)
+	defer flushTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case res := <-results:
+		case <-flushTicker.C:
+			writer.Flush()
+			f.Sync()
+		case res, ok := <-results:
+			if !ok {
+				return
+			}
 			lowerName := strings.ToLower(res.Name)
 			if _, exists := blacklistMap[lowerName]; exists {
 				continue
@@ -387,9 +432,10 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 
 			seenHits[lowerName] = struct{}{}
 			metricHits.Add(1)
-			fmt.Printf("🔥 [BULUNDU] -> %s\n", res.Name)
-			f.WriteString(fmt.Sprintf("%s\n", res.Name))
-			f.Sync()
+			
+			fmt.Printf("\r\033[K🔥 [BULUNDU] -> %s\n", res.Name)
+
+			writer.WriteString(res.Name + "\n")
 
 			payload := BuildChessWebhookPayload(res)
 			select {
@@ -402,7 +448,6 @@ func resultHandler(ctx context.Context, results <-chan CheckResult) {
 
 func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
 	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
-
 	score, typeDesc := evaluateNameDetailed(hit.Name)
 	encodedName := url.PathEscape(hit.Name)
 	profileURL := fmt.Sprintf("https://www.chess.com/member/%s", encodedName)
@@ -427,12 +472,16 @@ func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
 	}
 }
 
-func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
+func webhookWorker(ctx context.Context, queue <-chan WebhookPayload, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case payload := <-queue:
+		case payload, ok := <-queue:
+			if !ok {
+				return
+			}
 			sendToDiscord(payload)
 		}
 	}
@@ -478,7 +527,7 @@ func evaluateNameDetailed(name string) (string, string) {
 			hasLetter = true
 		} else if c >= '0' && c <= '9' {
 			hasNumber = true
-		} else if c == '_' { // '-' kontrolü buradan da tamamen kaldırıldı
+		} else if c == '_' || c == '-' {
 			hasSpecial = true
 		}
 	}
