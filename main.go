@@ -112,7 +112,7 @@ func main() {
 		go webhookWorker(ctx, webhookQueue)
 	}
 
-	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor...")
+	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor (En az 1 harf şartı devrede)...")
 	validNames := generateValidNames(TargetLength)
 
 	fmt.Println("🔀 İsimler karıştırılıyor...")
@@ -177,36 +177,44 @@ outerLoop:
 	time.Sleep(2 * time.Second)
 }
 
+// Yeni kurala göre güncellenmiş İsim Oluşturucu
 func generateValidNames(length int) []string {
 	var results []string
-	alphaNum := "abcdefghijklmnopqrstuvwxyz0123456789"
-	symbols := "-_"
+	letters := "abcdefghijklmnopqrstuvwxyz"
+	numbers := "0123456789"
 
-	var generate func(current string)
-	generate = func(current string) {
+	// Rekürsif fonksiyona "hasLetter" (harf içeriyor mu?) kontrolü eklendi
+	var generate func(current string, hasLetter bool)
+	generate = func(current string, hasLetter bool) {
 		if len(current) == length {
-			results = append(results, current)
+			if hasLetter { // Eğer kelimede en az 1 harf varsa kaydet
+				results = append(results, current)
+			}
 			return
 		}
 
 		isFirst := len(current) == 0
 		isLast := len(current) == length-1
 
-		for _, c := range alphaNum {
-			generate(current + string(c))
+		// Harfleri ekle (Harf eklendiği için hasLetter TRUE olur)
+		for _, c := range letters {
+			generate(current+string(c), true)
 		}
 
+		// Rakamları ekle (Harf durumu değişmez)
+		for _, c := range numbers {
+			generate(current+string(c), hasLetter)
+		}
+
+		// '_' sembolünü ekle (Başta veya sonda olamaz, peş peşe olamaz, '-' YASAKLI)
 		if !isFirst && !isLast {
-			prevChar := current[len(current)-1]
-			if prevChar != '-' && prevChar != '_' {
-				for _, c := range symbols {
-					generate(current + string(c))
-				}
+			if current[len(current)-1] != '_' {
+				generate(current+"_", hasLetter)
 			}
 		}
 	}
 
-	generate("")
+	generate("", false)
 	return results
 }
 
@@ -470,7 +478,7 @@ func evaluateNameDetailed(name string) (string, string) {
 			hasLetter = true
 		} else if c >= '0' && c <= '9' {
 			hasNumber = true
-		} else if c == '_' || c == '-' {
+		} else if c == '_' { // '-' kontrolü buradan da tamamen kaldırıldı
 			hasSpecial = true
 		}
 	}
