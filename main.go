@@ -96,6 +96,105 @@ func main() {
 	// Rastgelelik için seed
 	rand.Seed(time.Now().UnixNano())
 
+	ctx, cancel := context.WithCancel```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// --- YAPILANDIRMA (AYARLAR BURADA SABİTLENDİ) ---
+const (
+	TargetLength = 3 // Aranan kelimenin uzunluğu (3 karakter)
+	SafeThreads  = 3 // Tek IP için en güvenli thread sayısı (Asla 429 yemez)
+	WebhookURL   = "[https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI](https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI)"
+)
+
+// --- METRICS & RATE LIMIT STATE ---
+var (
+	metricReqs     atomic.Uint64
+	metric429s     atomic.Uint64
+	metric5xxs     atomic.Uint64
+	metricTimeouts atomic.Uint64
+	metricHits     atomic.Uint64
+	metricLatSum   atomic.Uint64
+	metricLatCount atomic.Uint64
+
+	globalPauseUntil atomic.Int64
+	currentLoop      atomic.Int64
+	blacklistMap     = make(map[string]struct{})
+	webhookQueue     = make(chan WebhookPayload, 1000)
+)
+
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+}
+
+var client = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	},
+}
+
+type CheckResult struct {
+	Name   string
+	Status string
+}
+
+type WebhookPayload struct {
+	Embeds []WebhookEmbed `json:"embeds"`
+}
+
+type WebhookEmbed struct {
+	Title  string         `json:"title"`
+	Color  int            `json:"color"`
+	Fields []WebhookField `json:"fields"`
+	Footer WebhookFooter  `json:"footer"`
+}
+
+type WebhookField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+type WebhookFooter struct {
+	Text string `json:"text"`
+}
+
+func main() {
+	// Worker komut satırı argümanları (Terminalden kontrol etmek için)
+	workerID := flag.Int("worker", 0, "Bu sunucunun/programin ID'si (Örn: 0)")
+	totalNodes := flag.Int("total", 1, "Toplam çalışacak sunucu/program sayısı (Örn: 1)")
+	flag.Parse()
+
+	// Rastgelelik için seed
+	rand.Seed(time.Now().UnixNano())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -290,7 +389,7 @@ func checkChessName(ctx context.Context, name string, results chan<- CheckResult
 
 		waitIfRateLimited(ctx)
 
-		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.chess.com/pub/player/"+name, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", "[https://api.chess.com/pub/player/](https://api.chess.com/pub/player/)"+name, nil)
 		if err != nil {
 			continue
 		}
@@ -437,19 +536,6 @@ func webhookWorker(ctx context.Context, queue <-chan WebhookPayload) {
 }
 
 func sendToDiscord(payload WebhookPayload) {
-	jsonBytes, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	req, err := http.NewRequest("POST", WebhookURL, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(resp := client.Do(req)) // Derleme hatasını önlemek için düzeltildi
-}
-
-func sendToDiscordCorrected(payload WebhookPayload) {
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		return
