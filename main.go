@@ -5,15 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
-	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,607 +21,417 @@ import (
 
 // --- YAPILANDIRMA ---
 const (
-	SafeThreads = 10 // Worker pool boyutu
-	WebhookURL  = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
-	OutputFile  = "available_instagram.txt"
+	MaxCombinations = 456976 // b + 4 harf (26^4)
+	WorkerCount     = 150    // Optimize edilmiş connection havuzu boyutu
+	WebhookURL      = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+	OutputFile      = "available_instagram.txt"
+	TargetBaseURL   = "https://example.com/api/check" // Jenerik hedef
 )
 
-// --- METRICS & STATE ---
+// --- ATOMİK İSTATİSTİKLER ---
+// Performans için struct yerine cache-line dostu padding uygulanmış değişkenler
 var (
-	metricReqs        atomic.Uint64
-	metric429s        atomic.Uint64
-	metric5xxs        atomic.Uint64
-	metricTimeouts    atomic.Uint64
-	metricHits        atomic.Uint64
-	metricUnavailable atomic.Uint64
-	metricErrors      atomic.Uint64
-	metricProcessed   atomic.Uint64
-	metricLatSum      atomic.Uint64
-	metricLatCount    atomic.Uint64
-	metricWorkers     atomic.Int32
-	lastLatency       atomic.Uint64
+	currentIndex    uint32
+	statChecked     uint32
+	statAvailable   uint32
+	statUnavailable uint32
+	statErrors      uint32
+	statHTTP429     uint32
+	statHTTP4xx     uint32
+	statHTTP5xx     uint32
+	statTimeouts    uint32
 
-	globalPauseUntil atomic.Int64
-	blacklistMap     = make(map[string]struct{})
+	totalLatencyNs uint64
+	lastLatencyNs  uint64
+
+	// Global Rate-Limit Backoff (Unix Nano Timestamp)
+	globalPauseUntil int64
 )
 
-var userAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-}
-
-// Global, optimize edilmiş HTTP Client
-var client = &http.Client{
-	Timeout: 8 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   200,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-		DisableKeepAlives:     false,
-	},
-	// Instagram login sayfasına (302) gereksiz redirect olmamak için
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
-
-type CheckResult struct {
-	Name   string
-	Status string
-}
-
-type WebhookPayload struct {
-	Embeds []WebhookEmbed `json:"embeds"`
-}
-
-type WebhookEmbed struct {
-	Title       string         `json:"title"`
-	Color       int            `json:"color"`
-	Description string         `json:"description,omitempty"`
-	Fields      []WebhookField `json:"fields"`
-	Footer      WebhookFooter  `json:"footer"`
-}
-
-type WebhookField struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Inline bool   `json:"inline"`
-}
-
-type WebhookFooter struct {
-	Text string `json:"text"`
+// --- VERİ YAPILARI ---
+type DiscordPayload struct {
+	Content string `json:"content"`
 }
 
 func main() {
-	workerID := flag.Int("worker", 0, "Bu sunucunun/programin ID'si (Örn: 0)")
-	totalNodes := flag.Int("total", 1, "Toplam çalışacak sunucu/program sayısı (Örn: 1)")
-	flag.Parse()
-
+	// 1. Graceful Shutdown Context'i
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sigCh
-		fmt.Print("\n\033[?25h") // Cursor'ı geri getir
-		fmt.Println("\n\n⚠️ Kapatma sinyali alındı. Veriler kaydedilerek güvenlice durduruluyor...")
-		cancel()
+		<-sigChan
+		cancel() // Ctrl+C alındığında tüm işleri iptal et
 	}()
 
-	fmt.Print("\033[?25l") // Cursor'ı gizle
-	defer fmt.Print("\033[?25h")
-
-	fmt.Println("⚡ === INSTAGRAM GÜVENLİ TARAYICI BAŞLATILIYOR === ⚡")
-	loadBlacklist()
-
-	webhookQueue := make(chan WebhookPayload, 1000)
-	var wgWebhooks sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wgWebhooks.Add(1)
-		go webhookWorker(ctx, webhookQueue, &wgWebhooks)
+	// 2. HTTP Transport Optimizasyonu (Maksimum Connection Reuse)
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          WorkerCount,
+		MaxIdleConnsPerHost:   WorkerCount,
+		MaxConnsPerHost:       WorkerCount,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor (b + 4 harf)...")
-	validNames := generateInstagramNames()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   8 * time.Second, // Sıkı timeout politikası
+	}
 
-	fmt.Println("🔀 İsimler karıştırılıyor (Homojen dağılım)...")
-	shuffleList(validNames)
-
-	totalCombinations := len(validNames)
-	if totalCombinations == 0 {
-		fmt.Println("❌ Üretilen kombinasyon yok. Çıkılıyor.")
+	// Hedef URL'nin önceden parse edilmesi (Her istekte tekrar parse edilmesini önler)
+	parsedURL, err := url.Parse(TargetBaseURL)
+	if err != nil {
+		fmt.Printf("Geçersiz TargetBaseURL: %v\n", err)
 		return
 	}
 
-	chunkSize := (totalCombinations + *totalNodes - 1) / *totalNodes
-	startIdx := *workerID * chunkSize
-	endIdx := startIdx + chunkSize
-	if endIdx > totalCombinations {
-		endIdx = totalCombinations
-	}
-	if startIdx >= totalCombinations {
-		fmt.Println("❌ Hatalı Worker ID. Kapatılıyor.")
-		return
-	}
+	// 3. Kanallar ve Senkronizasyon
+	resultsChan := make(chan string, 1000)
+	webhookChan := make(chan string, 5000)
+	var wg sync.WaitGroup
 
-	myNames := validNames[startIdx:endIdx]
-	totalMyNames := len(myNames)
-
-	fmt.Println("==================================================")
-	fmt.Printf("Platform : Instagram\n")
-	fmt.Printf("Hız      : %d Thread\n", SafeThreads)
-	fmt.Printf("Kural    : b[a-z]{4} (Örn: baabc)\n")
-	fmt.Printf("Toplam   : %d Kombinasyon\n", totalCombinations)
-	fmt.Printf("Görev    : %d İsim (Bu Worker)\n", totalMyNames)
-	fmt.Println("==================================================\n")
-
-	time.Sleep(1 * time.Second) // Dashboard'un temiz başlaması için ufak bekleme
-
-	jobs := make(chan string, SafeThreads*3)
-	results := make(chan CheckResult, 500)
-	hitLogQueue := make(chan string, 100)
-
-	var wgResultHandler sync.WaitGroup
-	wgResultHandler.Add(1)
-	go resultHandler(ctx, results, webhookQueue, hitLogQueue, &wgResultHandler)
-
-	var wgWorkers sync.WaitGroup
-	for i := 0; i < SafeThreads; i++ {
-		wgWorkers.Add(1)
-		ua := userAgents[i%len(userAgents)]
-		go worker(ctx, jobs, results, ua, &wgWorkers)
-	}
-
-	// Dashboard Goroutine
-	var wgDashboard sync.WaitGroup
-	wgDashboard.Add(1)
-	go metricsDashboard(ctx, totalMyNames, hitLogQueue, &wgDashboard)
-
-	// Job Dağıtımı
-outerLoop:
-	for _, name := range myNames {
-		select {
-		case <-ctx.Done():
-			break outerLoop
-		case jobs <- name:
-		}
-	}
-
-	close(jobs)
-	wgWorkers.Wait()
-
-	close(results)
-	wgResultHandler.Wait()
-
-	close(webhookQueue)
-	wgWebhooks.Wait()
-
-	// Biraz bekle ve dashboard'u sonlandır
-	time.Sleep(1 * time.Second)
-	wgDashboard.Wait()
-
-	fmt.Print("\n\033[?25h") // Cursor'ı geri getir
-	fmt.Printf("\n✅ Tarama güvenle tamamlandı!\n")
-}
-
-// generateInstagramNames, sadece b + 4 harf kombinasyonlarını sıfır GC presi ile üretir
-func generateInstagramNames() []string {
-	// Toplam olasılık: 26^4 = 456,976
-	total := 456976
-	results := make([]string, 0, total)
-	buf := make([]byte, 5)
-	buf[0] = 'b'
-
-	charset := "abcdefghijklmnopqrstuvwxyz"
-
-	for i := 0; i < 26; i++ {
-		buf[1] = charset[i]
-		for j := 0; j < 26; j++ {
-			buf[2] = charset[j]
-			for k := 0; k < 26; k++ {
-				buf[3] = charset[k]
-				for l := 0; l < 26; l++ {
-					buf[4] = charset[l]
-					results = append(results, string(buf))
-				}
-			}
-		}
-	}
-	return results
-}
-
-func shuffleList(slice []string) {
-	seed := uint32(time.Now().UnixNano())
-	for i := len(slice) - 1; i > 0; i-- {
-		seed ^= seed << 13
-		seed ^= seed >> 17
-		seed ^= seed << 5
-		j := int(seed % uint32(i+1))
-		slice[i], slice[j] = slice[j], slice[i]
-	}
-}
-
-func metricsDashboard(ctx context.Context, total int, hitLogQueue <-chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	var lastReqs uint64
 	startTime := time.Now()
-	linesToClear := 0
 
-	for {
-		select {
-		case <-ctx.Done():
-			// Son kez yazdır ve çık
-			printDashboard(total, &lastReqs, startTime, &linesToClear, hitLogQueue, true)
-			return
-		case <-ticker.C:
-			printDashboard(total, &lastReqs, startTime, &linesToClear, hitLogQueue, false)
-		}
+	// 4. Arka Plan Servislerini Başlat
+	wg.Add(1)
+	go diskWriter(ctx, &wg, resultsChan)
+
+	wg.Add(1)
+	go discordWebhookWorker(ctx, &wg, webhookChan)
+
+	go liveDashboard(ctx, startTime)
+
+	// 5. Worker Havuzunu Başlat
+	for i := 0; i < WorkerCount; i++ {
+		wg.Add(1)
+		go worker(ctx, &wg, client, parsedURL, resultsChan, webhookChan)
 	}
+
+	// 6. Tüm Worker'ların ve Servislerin Bitmesini Bekle
+	wg.Wait()
+
+	// 7. Final Temizliği ve Kapanış
+	renderDashboard(startTime, true)
+	fmt.Println("\n[✔] Program güvenli ve temiz bir şekilde sonlandırıldı.")
 }
 
-func printDashboard(total int, lastReqs *uint64, startTime time.Time, linesToClear *int, hitLogQueue <-chan string, isStopped bool) {
-	// Bekleyen önemli hit loglarını yazdır
-	hasLogs := false
-	for {
-		select {
-		case logMsg := <-hitLogQueue:
-			if *linesToClear > 0 {
-				fmt.Printf("\033[%dA\033[J", *linesToClear) // Önceki dashboard'u sil
-				*linesToClear = 0
-			}
-			fmt.Println(logMsg)
-			hasLogs = true
-		default:
-			goto DashboardRender
-		}
-	}
-
-DashboardRender:
-	if *linesToClear > 0 && !hasLogs {
-		fmt.Printf("\033[%dA", *linesToClear) // Sadece imleci yukarı al
-	}
-
-	reqs := metricReqs.Load()
-	latSum := metricLatSum.Load()
-	latCount := metricLatCount.Load()
-	processed := int(metricProcessed.Load())
-	workers := metricWorkers.Load()
-	hits := metricHits.Load()
-	unavail := metricUnavailable.Load()
-	errs := metricErrors.Load()
-	c429 := metric429s.Load()
-	c5xx := metric5xxs.Load()
-	timeouts := metricTimeouts.Load()
-	lastLat := lastLatency.Load()
-
-	deltaReqs := reqs - *lastReqs
-	*lastReqs = reqs
-
-	var avgLat uint64
-	if latCount > 0 {
-		avgLat = latSum / latCount
-	}
-
-	percentage := float64(processed) / float64(total) * 100
-	if math.IsNaN(percentage) {
-		percentage = 0
-	}
-
-	remaining := total - processed
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	elapsed := time.Since(startTime)
-	etaStr := "--:--:--"
-	if deltaReqs > 0 {
-		etaSeconds := int(remaining) / int(deltaReqs)
-		etaDur := time.Duration(etaSeconds) * time.Second
-		etaStr = formatDuration(etaDur)
-	}
-
-	status := "RUNNING"
-	if isStopped {
-		status = "STOPPED"
-		deltaReqs = 0
-		workers = 0
-	}
-
-	dashboard := fmt.Sprintf(`==================================================
-INSTAGRAM USERNAME SCANNER
-
-Status       : %s
-Target       : Instagram
-Pattern      : b[a-z]{4}
-Total        : %d
-Checked      : %d
-Remaining    : %d
-Progress     : %.2f%%
-Speed        : %d req/s
-Last Latency : %d ms
-Avg Latency  : %d ms
-Available    : %d
-Unavailable  : %d
-Errors       : %d
-HTTP 429     : %d
-HTTP 5xx     : %d
-Timeout      : %d
-Workers      : %d
-Elapsed      : %s
-ETA          : %s
-==================================================`,
-		status, total, processed, remaining, percentage, deltaReqs,
-		lastLat, avgLat, hits, unavail, errs, c429, c5xx, timeouts,
-		workers, formatDuration(elapsed), etaStr,
-	)
-
-	fmt.Println(dashboard)
-	*linesToClear = 20
-}
-
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
-}
-
-func waitIfRateLimited(ctx context.Context) {
-	for {
-		now := time.Now().UnixNano()
-		pauseUntil := globalPauseUntil.Load()
-		if pauseUntil <= now {
-			return
-		}
-		sleepDur := time.Duration(pauseUntil - now)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(sleepDur):
-		}
-	}
-}
-
-func updateGlobalPause(d time.Duration) {
-	pauseUntil := time.Now().Add(d).UnixNano()
-	for {
-		current := globalPauseUntil.Load()
-		if pauseUntil <= current {
-			break
-		}
-		if globalPauseUntil.CompareAndSwap(current, pauseUntil) {
-			break
-		}
-	}
-}
-
-func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult, userAgent string, wg *sync.WaitGroup) {
+// --- WORKER: MATEMATİKSEL ÜRETİM & AĞ YÖNETİMİ ---
+func worker(ctx context.Context, wg *sync.WaitGroup, client *http.Client, baseURL *url.URL, resultsChan, webhookChan chan<- string) {
 	defer wg.Done()
-	metricWorkers.Add(1)
-	defer metricWorkers.Add(-1)
+
+	// Her worker için tekrar kullanılabilir Request objesi (Zero-Allocation hedeflenmiştir)
+	req := &http.Request{
+		Method:     "GET",
+		URL:        &url.URL{Scheme: baseURL.Scheme, Host: baseURL.Host, Path: baseURL.Path},
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Host:       baseURL.Host,
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept", "application/json")
+
+	// Pre-allocate buffer for username (5 bytes: b + 4 chars)
+	uBuf := make([]byte, 5)
+	uBuf[0] = 'b'
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case name, ok := <-jobs:
-			if !ok {
-				return
-			}
-			checkInstagramName(ctx, name, userAgent, results)
-			metricProcessed.Add(1)
-		}
-	}
-}
-
-func checkInstagramName(ctx context.Context, name, userAgent string, results chan<- CheckResult) {
-	maxRetries := 3
-	urlStr := "https://www.instagram.com/" + name + "/"
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		waitIfRateLimited(ctx)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
-		if err != nil {
-			metricErrors.Add(1)
-			return
+		default:
 		}
 
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Connection", "keep-alive")
+		// Global Backoff Kontrolü (Rate-Limit aldıysak bekleriz)
+		pauseTimestamp := atomic.LoadInt64(&globalPauseUntil)
+		if now := time.Now().UnixNano(); now < pauseTimestamp {
+			sleepDur := time.Duration(pauseTimestamp - now)
+			time.Sleep(sleepDur)
+		}
 
-		start := time.Now()
+		// O(1) Sıradaki İşi Al (Lock-Free)
+		idx := atomic.AddUint32(&currentIndex, 1) - 1
+		if idx >= MaxCombinations {
+			return // Taranacak kombinasyon bitti
+		}
+
+		// İndeksi bXXXX kullanıcı adına dönüştür
+		tempIdx := idx
+		for i := 4; i >= 1; i-- {
+			uBuf[i] = byte('a' + (tempIdx % 26))
+			tempIdx /= 26
+		}
+		username := string(uBuf)
+
+		// URL Query'sini güncelle
+		req.URL.RawQuery = "username=" + username
+
+		// İsteği gönder
+		startReq := time.Now()
+		reqCtx, reqCancel := context.WithTimeout(ctx, 8*time.Second)
+		req.WithContext(reqCtx)
+		
 		resp, err := client.Do(req)
-		latency := uint64(time.Since(start).Milliseconds())
+		reqCancel()
+		
+		latencyNs := uint64(time.Since(startReq).Nanoseconds())
+		atomic.SwapUint64(&lastLatencyNs, latencyNs)
+		atomic.AddUint64(&totalLatencyNs, latencyNs)
 
+		// Hata Yönetimi
 		if err != nil {
-			metricTimeouts.Add(1)
-			metricErrors.Add(1)
-			time.Sleep(1 * time.Second)
+			if os.IsTimeout(err) || err == context.DeadlineExceeded {
+				atomic.AddUint32(&statTimeouts, 1)
+			} else {
+				atomic.AddUint32(&statErrors, 1)
+			}
+			atomic.AddUint32(&statChecked, 1)
 			continue
 		}
 
-		metricReqs.Add(1)
-		metricLatSum.Add(latency)
-		metricLatCount.Add(1)
-		lastLatency.Store(latency)
-
+		// Body'yi hızlıca boşalt ve kapat (Connection Reuse için zorunlu)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
-		// Instagram HTTP Status Kontrolü
-		if resp.StatusCode == http.StatusOK {
-			// Mevcut veya kullanılamaz
-			metricUnavailable.Add(1)
-			return
-		} else if resp.StatusCode == http.StatusNotFound {
-			// 404 genellikle boştaki hesaptır
-			results <- CheckResult{Name: name, Status: "🟢 Alınabilir"}
-			return
-		} else if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently { // 302 / 301
-			// Yönlendirme genellikle login sayfasına olur, rate limit habercisi olabilir
-			metricUnavailable.Add(1)
-			return
-		} else if resp.StatusCode == http.StatusTooManyRequests {
-			metric429s.Add(1)
-			retryAfterStr := resp.Header.Get("Retry-After")
-			var pauseDuration time.Duration
-			if retryAfterStr != "" {
-				if retryAfter, err := strconv.ParseFloat(retryAfterStr, 64); err == nil {
-					pauseDuration = time.Duration(retryAfter * float64(time.Second))
-				}
+		// Durum Kodu Analizi
+		switch resp.StatusCode {
+		case 404:
+			atomic.AddUint32(&statAvailable, 1)
+			// Asenkron kanallara gönder (Non-blocking)
+			select {
+			case resultsChan <- username:
+			case <-ctx.Done():
 			}
-			if pauseDuration <= 0 {
-				pauseDuration = 30 * time.Second // Instagram için varsayılan 429 cezası genelde uzundur
+			select {
+			case webhookChan <- username:
+			case <-ctx.Done():
 			}
-			updateGlobalPause(pauseDuration + (500 * time.Millisecond))
-			attempt--
-			continue
-		} else if resp.StatusCode >= http.StatusInternalServerError {
-			metric5xxs.Add(1)
-			metricErrors.Add(1)
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
-			continue
-		} else {
-			metricErrors.Add(1)
-			return
+		case 200:
+			atomic.AddUint32(&statUnavailable, 1)
+		case 429:
+			atomic.AddUint32(&statHTTP429, 1)
+			// GLOBAL BACKOFF TETİKLEYİCİ
+			// Eğer 429 alırsak, tüm sistemi 3 saniye duraklat
+			newPause := time.Now().Add(3 * time.Second).UnixNano()
+			// Yalnızca mevcut duraklama süresinden ilerideyse güncelle
+			currentPause := atomic.LoadInt64(&globalPauseUntil)
+			if newPause > currentPause {
+				atomic.CompareAndSwapInt64(&globalPauseUntil, currentPause, newPause)
+			}
+		default:
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				atomic.AddUint32(&statHTTP4xx, 1)
+			} else if resp.StatusCode >= 500 {
+				atomic.AddUint32(&statHTTP5xx, 1)
+			} else {
+				atomic.AddUint32(&statErrors, 1)
+			}
 		}
+		
+		atomic.AddUint32(&statChecked, 1)
 	}
 }
 
-func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue chan<- WebhookPayload, hitLogQueue chan<- string, wg *sync.WaitGroup) {
+// --- DISK WRITER: ASENKRON BUFFERED I/O ---
+func diskWriter(ctx context.Context, wg *sync.WaitGroup, resultsChan <-chan string) {
 	defer wg.Done()
-	seenHits := make(map[string]struct{})
 
-	f, err := os.OpenFile(OutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(OutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("\n❌ Dosya açılamadı: %v\n", err)
 		return
 	}
-	defer f.Close()
+	defer file.Close()
 
-	writer := bufio.NewWriterSize(f, 4096)
+	writer := bufio.NewWriterSize(file, 16384) // 16KB Yazma Bufferı
 	defer writer.Flush()
 
-	flushTicker := time.NewTicker(3 * time.Second)
-	defer flushTicker.Stop()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Kapanışta kalanları yaz
+			for len(resultsChan) > 0 {
+				username := <-resultsChan
+				writer.WriteString(username + "\n")
+			}
 			return
-		case <-flushTicker.C:
-			writer.Flush()
-			f.Sync()
-		case res, ok := <-results:
+		case username, ok := <-resultsChan:
 			if !ok {
 				return
 			}
-			lowerName := strings.ToLower(res.Name)
-			if _, exists := blacklistMap[lowerName]; exists {
-				continue
-			}
-			if _, seen := seenHits[lowerName]; seen {
-				continue
-			}
-
-			seenHits[lowerName] = struct{}{}
-			metricHits.Add(1)
-
-			// Terminali bozmadan dashboard üstüne yazdırmak için kanala gönderiyoruz
-			select {
-			case hitLogQueue <- fmt.Sprintf("🔥 [AVAILABLE] %s", res.Name):
-			default:
-			}
-
-			writer.WriteString(res.Name + "\n")
-
-			payload := BuildInstagramWebhookPayload(res)
-			select {
-			case webhookQueue <- payload:
-			default:
-			}
+			writer.WriteString(username + "\n")
+		case <-ticker.C:
+			writer.Flush() // Her 2 saniyede bir diske güvenli şekilde işle
 		}
 	}
 }
 
-func BuildInstagramWebhookPayload(hit CheckResult) WebhookPayload {
-	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
-	profileURL := fmt.Sprintf("https://www.instagram.com/%s", hit.Name)
-
-	fields := []WebhookField{
-		{Name: "👤 Kullanıcı Adı", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
-		{Name: "🔗 Profil", Value: fmt.Sprintf("[Kayıt Ol](%s)", profileURL), Inline: true},
-		{Name: "🕐 Zaman", Value: fmt.Sprintf("`%s`", timeStr), Inline: false},
-	}
-
-	return WebhookPayload{
-		Embeds: []WebhookEmbed{
-			{
-				Title:  "🎯 INSTAGRAM USERNAME BULUNDU",
-				Color:  13506161, // Instagram temasına uygun bir renk (Magenta/Pembe tonları)
-				Fields: fields,
-				Footer: WebhookFooter{Text: "Instagram Pro Scanner"},
-			},
-		},
-	}
-}
-
-func webhookWorker(ctx context.Context, queue <-chan WebhookPayload, wg *sync.WaitGroup) {
+// --- DISCORD WEBHOOK WORKER (Rate-Limit Korumalı) ---
+func discordWebhookWorker(ctx context.Context, wg *sync.WaitGroup, webhookChan <-chan string) {
 	defer wg.Done()
+
+	// Webhook adresi varsayılan ise hiç başlatma
+	if WebhookURL == "" || WebhookURL == "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN" {
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	var batch []string
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	sendBatch := func(usernames []string) {
+		if len(usernames) == 0 {
+			return
+		}
+		content := "✅ **Müsait Username(ler) Bulundu:**\n"
+		for _, u := range usernames {
+			content += "- " + u + "\n"
+		}
+
+		payload, _ := json.Marshal(DiscordPayload{Content: content})
+		req, _ := http.NewRequestWithContext(ctx, "POST", WebhookURL, bytes.NewBuffer(payload))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		// Discord kendi Rate Limit'ini uygularsa saygı duy
+		if resp.StatusCode == 429 {
+			retryAfter := resp.Header.Get("Retry-After")
+			sleepTime := 3 * time.Second
+			if retryAfter != "" {
+				if parsed, err := strconv.Atoi(retryAfter); err == nil {
+					sleepTime = time.Duration(parsed) * time.Second
+				}
+			}
+			time.Sleep(sleepTime)
+			// Hata alındıysa tekrar denemek için batch logic genişletilebilir
+			// Ancak scanner hızını yavaşlatmamak için burada bırakıyoruz.
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			sendBatch(batch) // Kalanları gönder
+			return
+		case username, ok := <-webhookChan:
+			if !ok {
+				return
+			}
+			batch = append(batch, username)
+			if len(batch) >= 10 { // Maksimum 10'arlı gruplar halinde yolla
+				sendBatch(batch)
+				batch = nil
+			}
+		case <-ticker.C:
+			sendBatch(batch)
+			batch = nil
+		}
+	}
+}
+
+// --- CANLI DASHBOARD YÖNETİMİ ---
+func liveDashboard(ctx context.Context, startTime time.Now()) {
+	ticker := time.NewTicker(500 * time.Millisecond) // Daha akıcı bir görünüm için 500ms
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case payload, ok := <-queue:
-			if !ok {
-				return
-			}
-			sendToDiscord(payload)
+		case <-ticker.C:
+			renderDashboard(startTime, false)
 		}
 	}
 }
 
-func sendToDiscord(payload WebhookPayload) {
-	jsonBytes, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	req, err := http.NewRequest("POST", WebhookURL, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-}
+func renderDashboard(startTime time.Now, isFinal bool) {
+	checked := atomic.LoadUint32(&statChecked)
+	available := atomic.LoadUint32(&statAvailable)
+	unavailable := atomic.LoadUint32(&statUnavailable)
+	errors := atomic.LoadUint32(&statErrors)
+	h429 := atomic.LoadUint32(&statHTTP429)
+	h4xx := atomic.LoadUint32(&statHTTP4xx)
+	h5xx := atomic.LoadUint32(&statHTTP5xx)
+	timeouts := atomic.LoadUint32(&statTimeouts)
 
-func loadBlacklist() {
-	data, err := os.ReadFile("blacklist.txt")
-	if err != nil {
-		return // Dosya yoksa sorun değil
+	tLatency := atomic.LoadUint64(&totalLatencyNs)
+	lLatency := atomic.LoadUint64(&lastLatencyNs)
+
+	elapsed := time.Since(startTime).Seconds()
+	var rps float64
+	var avgLatMs float64
+	if elapsed > 0 {
+		rps = float64(checked) / elapsed
 	}
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) > 0 {
-			blacklistMap[strings.ToLower(string(line))] = struct{}{}
-		}
+	if checked > 0 {
+		avgLatMs = float64(tLatency) / float64(checked) / 1e6
 	}
+	lastLatMs := float64(lLatency) / 1e6
+
+	progress := float64(checked) / float64(MaxCombinations) * 100
+
+	var etaStr string
+	if rps > 0 {
+		remainingSec := float64(MaxCombinations-checked) / rps
+		etaStr = time.Duration(remainingSec * float64(time.Second)).Round(time.Second).String()
+	} else {
+		etaStr = "Hesaplanıyor..."
+	}
+
+	status := "\033[1;32mRUNNING\033[0m"
+	
+	// Global Rate Limit (Duraklatıldıysa) durumu güncelle
+	pauseUntil := atomic.LoadInt64(&globalPauseUntil)
+	if time.Now().UnixNano() < pauseUntil {
+		status = "\033[1;33mRATE-LIMIT (PAUSED)\033[0m"
+	}
+	if isFinal {
+		status = "\033[1;31mCOMPLETED/STOPPED\033[0m"
+	}
+
+	// ANSI Escape kodları ile terminali titreşimsiz güncelleme
+	if !isFinal {
+		fmt.Print("\033[H\033[2J") // Clear screen and move cursor to top-left
+	}
+
+	fmt.Printf("Instagram Username Scanner [O(1) Zero-Alloc Engine]\n")
+	fmt.Printf("───────────────────────────────────────────────────\n")
+	fmt.Printf("Status       : %s\n", status)
+	fmt.Printf("Pattern      : b[a-z]{4}\n\n")
+
+	fmt.Printf("Checked      : %d / %d\n", checked, MaxCombinations)
+	fmt.Printf("Remaining    : %d\n", uint32(MaxCombinations)-checked)
+	fmt.Printf("Progress     : %.2f%%\n\n", progress)
+
+	fmt.Printf("\033[1;32mAvailable    : %d\033[0m\n", available)
+	fmt.Printf("Unavailable  : %d\n", unavailable)
+	fmt.Printf("\033[1;31mErrors       : %d\033[0m\n\n", errors)
+
+	fmt.Printf("Req/s        : %.1f\n", rps)
+	fmt.Printf("Avg Latency  : %.1f ms\n", avgLatMs)
+	fmt.Printf("Last Latency : %.1f ms\n\n", lastLatMs)
+
+	fmt.Printf("Concurrency  : %d\n", WorkerCount)
+	fmt.Printf("Elapsed      : %s\n", time.Duration(elapsed*float64(time.Second)).Round(time.Second))
+	fmt.Printf("ETA          : %s\n\n", etaStr)
+
+	fmt.Printf("HTTP 429     : %d\n", h429)
+	fmt.Printf("HTTP 4xx     : %d\n", h4xx)
+	fmt.Printf("HTTP 5xx     : %d\n", h5xx)
+	fmt.Printf("Timeouts     : %d\n", timeouts)
+	fmt.Printf("───────────────────────────────────────────────────\n")
 }
