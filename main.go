@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -23,22 +22,25 @@ import (
 
 // --- YAPILANDIRMA ---
 const (
-	TargetLength = 3 // Aranan kelimenin uzunluğu
-	SafeThreads  = 3 // Tek IP için en güvenli thread sayısı
-	WebhookURL   = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
+	SafeThreads = 10 // Worker pool boyutu
+	WebhookURL  = "https://discord.com/api/webhooks/1548315868944142386/68B2biKu_Wz2_KNVwnwJwgtAbixCNnBcghiUDKFq8m5HkqsH0Ecipnsbx3i3BqzyOnLI"
+	OutputFile  = "available_instagram.txt"
 )
 
 // --- METRICS & STATE ---
 var (
-	metricReqs      atomic.Uint64
-	metric429s      atomic.Uint64
-	metric5xxs      atomic.Uint64
-	metricTimeouts  atomic.Uint64
-	metricHits      atomic.Uint64
-	metricProcessed atomic.Uint64
-	metricLatSum    atomic.Uint64
-	metricLatCount  atomic.Uint64
-	metricWorkers   atomic.Int32
+	metricReqs        atomic.Uint64
+	metric429s        atomic.Uint64
+	metric5xxs        atomic.Uint64
+	metricTimeouts    atomic.Uint64
+	metricHits        atomic.Uint64
+	metricUnavailable atomic.Uint64
+	metricErrors      atomic.Uint64
+	metricProcessed   atomic.Uint64
+	metricLatSum      atomic.Uint64
+	metricLatCount    atomic.Uint64
+	metricWorkers     atomic.Int32
+	lastLatency       atomic.Uint64
 
 	globalPauseUntil atomic.Int64
 	blacklistMap     = make(map[string]struct{})
@@ -52,15 +54,19 @@ var userAgents = []string{
 
 // Global, optimize edilmiş HTTP Client
 var client = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 8 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   200,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		DisableKeepAlives:     false,
+	},
+	// Instagram login sayfasına (302) gereksiz redirect olmamak için
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	},
 }
 
@@ -74,10 +80,11 @@ type WebhookPayload struct {
 }
 
 type WebhookEmbed struct {
-	Title  string         `json:"title"`
-	Color  int            `json:"color"`
-	Fields []WebhookField `json:"fields"`
-	Footer WebhookFooter  `json:"footer"`
+	Title       string         `json:"title"`
+	Color       int            `json:"color"`
+	Description string         `json:"description,omitempty"`
+	Fields      []WebhookField `json:"fields"`
+	Footer      WebhookFooter  `json:"footer"`
 }
 
 type WebhookField struct {
@@ -103,14 +110,14 @@ func main() {
 	go func() {
 		<-sigCh
 		fmt.Print("\n\033[?25h") // Cursor'ı geri getir
-		fmt.Println("\n⚠️ Kapatma sinyali alındı. Veriler kaydedilerek güvenlice durduruluyor...")
+		fmt.Println("\n\n⚠️ Kapatma sinyali alındı. Veriler kaydedilerek güvenlice durduruluyor...")
 		cancel()
 	}()
 
 	fmt.Print("\033[?25l") // Cursor'ı gizle
 	defer fmt.Print("\033[?25h")
 
-	fmt.Println("⚡ === CHESS.COM GÜVENLİ (STABİL) TARAYICI BAŞLATILIYOR === ⚡")
+	fmt.Println("⚡ === INSTAGRAM GÜVENLİ TARAYICI BAŞLATILIYOR === ⚡")
 	loadBlacklist()
 
 	webhookQueue := make(chan WebhookPayload, 1000)
@@ -120,15 +127,15 @@ func main() {
 		go webhookWorker(ctx, webhookQueue, &wgWebhooks)
 	}
 
-	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor...")
-	validNames := generateValidNames(TargetLength)
+	fmt.Println("⚙️ Geçerli isim kombinasyonları oluşturuluyor (b + 4 harf)...")
+	validNames := generateInstagramNames()
 
 	fmt.Println("🔀 İsimler karıştırılıyor (Homojen dağılım)...")
 	shuffleList(validNames)
 
 	totalCombinations := len(validNames)
 	if totalCombinations == 0 {
-		fmt.Println("❌ Üretilen geçerli kombinasyon yok. Çıkılıyor.")
+		fmt.Println("❌ Üretilen kombinasyon yok. Çıkılıyor.")
 		return
 	}
 
@@ -146,18 +153,23 @@ func main() {
 	myNames := validNames[startIdx:endIdx]
 	totalMyNames := len(myNames)
 
-	fmt.Printf("Platform: Chess.com\n")
-	fmt.Printf("Hız: %d Thread (Safe Mode) | Kapsam: %d Karakter\n", SafeThreads, TargetLength)
-	fmt.Printf("🎯 Toplam Geçerli İsim: %d | Bu Worker'ın Görevi: %d isim\n", totalCombinations, totalMyNames)
-	fmt.Printf("🔔 Discord Webhook: AKTİF\n")
-	fmt.Println("===========================================\n")
+	fmt.Println("==================================================")
+	fmt.Printf("Platform : Instagram\n")
+	fmt.Printf("Hız      : %d Thread\n", SafeThreads)
+	fmt.Printf("Kural    : b[a-z]{4} (Örn: baabc)\n")
+	fmt.Printf("Toplam   : %d Kombinasyon\n", totalCombinations)
+	fmt.Printf("Görev    : %d İsim (Bu Worker)\n", totalMyNames)
+	fmt.Println("==================================================\n")
 
-	jobs := make(chan string, SafeThreads*2)
-	results := make(chan CheckResult, 100)
+	time.Sleep(1 * time.Second) // Dashboard'un temiz başlaması için ufak bekleme
+
+	jobs := make(chan string, SafeThreads*3)
+	results := make(chan CheckResult, 500)
+	hitLogQueue := make(chan string, 100)
 
 	var wgResultHandler sync.WaitGroup
 	wgResultHandler.Add(1)
-	go resultHandler(ctx, results, webhookQueue, &wgResultHandler)
+	go resultHandler(ctx, results, webhookQueue, hitLogQueue, &wgResultHandler)
 
 	var wgWorkers sync.WaitGroup
 	for i := 0; i < SafeThreads; i++ {
@@ -166,11 +178,12 @@ func main() {
 		go worker(ctx, jobs, results, ua, &wgWorkers)
 	}
 
-	go metricsDashboard(ctx, totalMyNames)
+	// Dashboard Goroutine
+	var wgDashboard sync.WaitGroup
+	wgDashboard.Add(1)
+	go metricsDashboard(ctx, totalMyNames, hitLogQueue, &wgDashboard)
 
-	startTime := time.Now()
-
-	// Ana isim dağıtım döngüsü
+	// Job Dağıtımı
 outerLoop:
 	for _, name := range myNames {
 		select {
@@ -189,42 +202,37 @@ outerLoop:
 	close(webhookQueue)
 	wgWebhooks.Wait()
 
-	elapsed := time.Since(startTime)
-	fmt.Printf("\n✅ Tarama tamamlandı! Geçen Süre: %v\n", elapsed)
+	// Biraz bekle ve dashboard'u sonlandır
+	time.Sleep(1 * time.Second)
+	wgDashboard.Wait()
+
+	fmt.Print("\n\033[?25h") // Cursor'ı geri getir
+	fmt.Printf("\n✅ Tarama güvenle tamamlandı!\n")
 }
 
-func generateValidNames(length int) []string {
-	charset := []byte("abcdefghijklmnopqrstuvwxyz123456789_")
-	results := make([]string, 0, 45000)
-	buf := make([]byte, length)
+// generateInstagramNames, sadece b + 4 harf kombinasyonlarını sıfır GC presi ile üretir
+func generateInstagramNames() []string {
+	// Toplam olasılık: 26^4 = 456,976
+	total := 456976
+	results := make([]string, 0, total)
+	buf := make([]byte, 5)
+	buf[0] = 'b'
 
-	var gen func(pos int, hasLetter bool, lastChar byte)
-	gen = func(pos int, hasLetter bool, lastChar byte) {
-		if pos == length {
-			if hasLetter {
-				results = append(results, string(buf))
-			}
-			return
-		}
+	charset := "abcdefghijklmnopqrstuvwxyz"
 
-		for _, c := range charset {
-			if pos == 0 && c == '_' {
-				continue
+	for i := 0; i < 26; i++ {
+		buf[1] = charset[i]
+		for j := 0; j < 26; j++ {
+			buf[2] = charset[j]
+			for k := 0; k < 26; k++ {
+				buf[3] = charset[k]
+				for l := 0; l < 26; l++ {
+					buf[4] = charset[l]
+					results = append(results, string(buf))
+				}
 			}
-			if pos == length-1 && c == '_' {
-				continue
-			}
-			if c == '_' && lastChar == '_' {
-				continue
-			}
-
-			buf[pos] = c
-			isLetter := (c >= 'a' && c <= 'z')
-			gen(pos+1, hasLetter || isLetter, c)
 		}
 	}
-
-	gen(0, false, 0)
 	return results
 }
 
@@ -239,48 +247,135 @@ func shuffleList(slice []string) {
 	}
 }
 
-func metricsDashboard(ctx context.Context, total int) {
+func metricsDashboard(ctx context.Context, total int, hitLogQueue <-chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastReqs, lastLatSum, lastLatCount uint64
+	var lastReqs uint64
 	startTime := time.Now()
+	linesToClear := 0
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Son kez yazdır ve çık
+			printDashboard(total, &lastReqs, startTime, &linesToClear, hitLogQueue, true)
 			return
 		case <-ticker.C:
-			reqs := metricReqs.Load()
-			latSum := metricLatSum.Load()
-			latCount := metricLatCount.Load()
-			processed := metricProcessed.Load()
-			workers := metricWorkers.Load()
-
-			deltaReqs := reqs - lastReqs
-			deltaLatSum := latSum - lastLatSum
-			deltaLatCount := latCount - lastLatCount
-
-			var avgLat uint64
-			if deltaLatCount > 0 {
-				avgLat = deltaLatSum / deltaLatCount
-			}
-
-			percentage := float64(processed) / float64(total) * 100
-			if math.IsNaN(percentage) {
-				percentage = 0
-			}
-
-			elapsed := time.Since(startTime).Round(time.Second)
-
-			fmt.Printf("\r\033[K[%5.1f%%] 📊 Hız: %3d req/s | 📡 Ping: %4d ms | 🛑 429: %d | 🎯 Bulunan: %d | ⚡ Aktif: %d | ⏱️ %v",
-				percentage, deltaReqs, avgLat, metric429s.Load(), metricHits.Load(), workers, elapsed)
-
-			lastReqs = reqs
-			lastLatSum = latSum
-			lastLatCount = latCount
+			printDashboard(total, &lastReqs, startTime, &linesToClear, hitLogQueue, false)
 		}
 	}
+}
+
+func printDashboard(total int, lastReqs *uint64, startTime time.Time, linesToClear *int, hitLogQueue <-chan string, isStopped bool) {
+	// Bekleyen önemli hit loglarını yazdır
+	hasLogs := false
+	for {
+		select {
+		case logMsg := <-hitLogQueue:
+			if *linesToClear > 0 {
+				fmt.Printf("\033[%dA\033[J", *linesToClear) // Önceki dashboard'u sil
+				*linesToClear = 0
+			}
+			fmt.Println(logMsg)
+			hasLogs = true
+		default:
+			goto DashboardRender
+		}
+	}
+
+DashboardRender:
+	if *linesToClear > 0 && !hasLogs {
+		fmt.Printf("\033[%dA", *linesToClear) // Sadece imleci yukarı al
+	}
+
+	reqs := metricReqs.Load()
+	latSum := metricLatSum.Load()
+	latCount := metricLatCount.Load()
+	processed := int(metricProcessed.Load())
+	workers := metricWorkers.Load()
+	hits := metricHits.Load()
+	unavail := metricUnavailable.Load()
+	errs := metricErrors.Load()
+	c429 := metric429s.Load()
+	c5xx := metric5xxs.Load()
+	timeouts := metricTimeouts.Load()
+	lastLat := lastLatency.Load()
+
+	deltaReqs := reqs - *lastReqs
+	*lastReqs = reqs
+
+	var avgLat uint64
+	if latCount > 0 {
+		avgLat = latSum / latCount
+	}
+
+	percentage := float64(processed) / float64(total) * 100
+	if math.IsNaN(percentage) {
+		percentage = 0
+	}
+
+	remaining := total - processed
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	elapsed := time.Since(startTime)
+	etaStr := "--:--:--"
+	if deltaReqs > 0 {
+		etaSeconds := int(remaining) / int(deltaReqs)
+		etaDur := time.Duration(etaSeconds) * time.Second
+		etaStr = formatDuration(etaDur)
+	}
+
+	status := "RUNNING"
+	if isStopped {
+		status = "STOPPED"
+		deltaReqs = 0
+		workers = 0
+	}
+
+	dashboard := fmt.Sprintf(`==================================================
+INSTAGRAM USERNAME SCANNER
+
+Status       : %s
+Target       : Instagram
+Pattern      : b[a-z]{4}
+Total        : %d
+Checked      : %d
+Remaining    : %d
+Progress     : %.2f%%
+Speed        : %d req/s
+Last Latency : %d ms
+Avg Latency  : %d ms
+Available    : %d
+Unavailable  : %d
+Errors       : %d
+HTTP 429     : %d
+HTTP 5xx     : %d
+Timeout      : %d
+Workers      : %d
+Elapsed      : %s
+ETA          : %s
+==================================================`,
+		status, total, processed, remaining, percentage, deltaReqs,
+		lastLat, avgLat, hits, unavail, errs, c429, c5xx, timeouts,
+		workers, formatDuration(elapsed), etaStr,
+	)
+
+	fmt.Println(dashboard)
+	*linesToClear = 20
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 func waitIfRateLimited(ctx context.Context) {
@@ -325,26 +420,27 @@ func worker(ctx context.Context, jobs <-chan string, results chan<- CheckResult,
 			if !ok {
 				return
 			}
-			checkChessName(ctx, name, userAgent, results)
+			checkInstagramName(ctx, name, userAgent, results)
 			metricProcessed.Add(1)
 		}
 	}
 }
 
-func checkChessName(ctx context.Context, name, userAgent string, results chan<- CheckResult) {
+func checkInstagramName(ctx context.Context, name, userAgent string, results chan<- CheckResult) {
 	maxRetries := 3
-	urlStr := "https://api.chess.com/pub/player/" + name
+	urlStr := "https://www.instagram.com/" + name + "/"
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		waitIfRateLimited(ctx)
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 		if err != nil {
+			metricErrors.Add(1)
 			return
 		}
 
 		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		req.Header.Set("Connection", "keep-alive")
 
 		start := time.Now()
@@ -353,6 +449,7 @@ func checkChessName(ctx context.Context, name, userAgent string, results chan<- 
 
 		if err != nil {
 			metricTimeouts.Add(1)
+			metricErrors.Add(1)
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -360,14 +457,23 @@ func checkChessName(ctx context.Context, name, userAgent string, results chan<- 
 		metricReqs.Add(1)
 		metricLatSum.Add(latency)
 		metricLatCount.Add(1)
+		lastLatency.Store(latency)
 
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
+		// Instagram HTTP Status Kontrolü
 		if resp.StatusCode == http.StatusOK {
+			// Mevcut veya kullanılamaz
+			metricUnavailable.Add(1)
 			return
 		} else if resp.StatusCode == http.StatusNotFound {
+			// 404 genellikle boştaki hesaptır
 			results <- CheckResult{Name: name, Status: "🟢 Alınabilir"}
+			return
+		} else if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently { // 302 / 301
+			// Yönlendirme genellikle login sayfasına olur, rate limit habercisi olabilir
+			metricUnavailable.Add(1)
 			return
 		} else if resp.StatusCode == http.StatusTooManyRequests {
 			metric429s.Add(1)
@@ -379,36 +485,38 @@ func checkChessName(ctx context.Context, name, userAgent string, results chan<- 
 				}
 			}
 			if pauseDuration <= 0 {
-				pauseDuration = 5 * time.Second
+				pauseDuration = 30 * time.Second // Instagram için varsayılan 429 cezası genelde uzundur
 			}
-			updateGlobalPause(pauseDuration + (250 * time.Millisecond))
+			updateGlobalPause(pauseDuration + (500 * time.Millisecond))
 			attempt--
 			continue
 		} else if resp.StatusCode >= http.StatusInternalServerError {
 			metric5xxs.Add(1)
+			metricErrors.Add(1)
 			time.Sleep(time.Duration(1<<attempt) * time.Second)
 			continue
 		} else {
+			metricErrors.Add(1)
 			return
 		}
 	}
 }
 
-func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue chan<- WebhookPayload, wg *sync.WaitGroup) {
+func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue chan<- WebhookPayload, hitLogQueue chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	seenHits := make(map[string]struct{})
 
-	f, err := os.OpenFile("hits_chess.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(OutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("\n❌ Dosya açılamadı: %v\n", err)
 		return
 	}
 	defer f.Close()
 
-	writer := bufio.NewWriter(f)
+	writer := bufio.NewWriterSize(f, 4096)
 	defer writer.Flush()
 
-	flushTicker := time.NewTicker(5 * time.Second)
+	flushTicker := time.NewTicker(3 * time.Second)
 	defer flushTicker.Stop()
 
 	for {
@@ -432,12 +540,16 @@ func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue
 
 			seenHits[lowerName] = struct{}{}
 			metricHits.Add(1)
-			
-			fmt.Printf("\r\033[K🔥 [BULUNDU] -> %s\n", res.Name)
+
+			// Terminali bozmadan dashboard üstüne yazdırmak için kanala gönderiyoruz
+			select {
+			case hitLogQueue <- fmt.Sprintf("🔥 [AVAILABLE] %s", res.Name):
+			default:
+			}
 
 			writer.WriteString(res.Name + "\n")
 
-			payload := BuildChessWebhookPayload(res)
+			payload := BuildInstagramWebhookPayload(res)
 			select {
 			case webhookQueue <- payload:
 			default:
@@ -446,27 +558,23 @@ func resultHandler(ctx context.Context, results <-chan CheckResult, webhookQueue
 	}
 }
 
-func BuildChessWebhookPayload(hit CheckResult) WebhookPayload {
+func BuildInstagramWebhookPayload(hit CheckResult) WebhookPayload {
 	timeStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
-	score, typeDesc := evaluateNameDetailed(hit.Name)
-	encodedName := url.PathEscape(hit.Name)
-	profileURL := fmt.Sprintf("https://www.chess.com/member/%s", encodedName)
+	profileURL := fmt.Sprintf("https://www.instagram.com/%s", hit.Name)
 
 	fields := []WebhookField{
-		{Name: "👤 İsim", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
-		{Name: "⭐ Puan", Value: fmt.Sprintf("`%s`", score), Inline: true},
-		{Name: "🏷️ Kategori", Value: fmt.Sprintf("`%s`", typeDesc), Inline: true},
-		{Name: "🔗 Profil", Value: fmt.Sprintf("[Kayıt Ol](%s)", profileURL), Inline: false},
+		{Name: "👤 Kullanıcı Adı", Value: fmt.Sprintf("`%s`", hit.Name), Inline: true},
+		{Name: "🔗 Profil", Value: fmt.Sprintf("[Kayıt Ol](%s)", profileURL), Inline: true},
 		{Name: "🕐 Zaman", Value: fmt.Sprintf("`%s`", timeStr), Inline: false},
 	}
 
 	return WebhookPayload{
 		Embeds: []WebhookEmbed{
 			{
-				Title:  "🎯 CHESS.COM KULLANICI ADI BULUNDU",
-				Color:  5763719,
+				Title:  "🎯 INSTAGRAM USERNAME BULUNDU",
+				Color:  13506161, // Instagram temasına uygun bir renk (Magenta/Pembe tonları)
 				Fields: fields,
-				Footer: WebhookFooter{Text: "Chess.com Pro Scanner"},
+				Footer: WebhookFooter{Text: "Instagram Pro Scanner"},
 			},
 		},
 	}
@@ -508,7 +616,7 @@ func sendToDiscord(payload WebhookPayload) {
 func loadBlacklist() {
 	data, err := os.ReadFile("blacklist.txt")
 	if err != nil {
-		return
+		return // Dosya yoksa sorun değil
 	}
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
@@ -517,43 +625,4 @@ func loadBlacklist() {
 			blacklistMap[strings.ToLower(string(line))] = struct{}{}
 		}
 	}
-}
-
-func evaluateNameDetailed(name string) (string, string) {
-	hasLetter, hasNumber, hasSpecial := false, false, false
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			hasLetter = true
-		} else if c >= '0' && c <= '9' {
-			hasNumber = true
-		} else if c == '_' || c == '-' {
-			hasSpecial = true
-		}
-	}
-
-	score := 5.0
-	typeDesc := "Karışık"
-
-	if hasLetter && !hasNumber && !hasSpecial {
-		score += 4.0
-		typeDesc = "Saf Harf"
-	} else if hasNumber && !hasLetter && !hasSpecial {
-		score += 5.0
-		typeDesc = "Saf Sayı"
-	} else if hasLetter && hasNumber && !hasSpecial {
-		score += 2.0
-		typeDesc = "Harf + Sayı"
-	} else if hasSpecial {
-		typeDesc = "Sembol İçeriyor"
-	}
-
-	if len(name) == 3 {
-		score += 1.0
-	}
-
-	if score > 10.0 {
-		score = 10.0
-	}
-	return fmt.Sprintf("%.1f/10", score), typeDesc
 }
